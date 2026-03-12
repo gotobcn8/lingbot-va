@@ -4,8 +4,8 @@ from typing import Dict, Optional, Tuple
 
 from typing_extensions import override
 import websockets.sync.client
+# from .msgpack_numpy import Packer, unpackb
 from .msgpack_numpy import Packer, unpackb
-
 
 class WebsocketClientPolicy:
     """Implements the Policy interface by communicating with a server over websocket.

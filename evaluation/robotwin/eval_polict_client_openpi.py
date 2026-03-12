@@ -5,8 +5,9 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
+import inspect
 
-robowin_root = Path("/path/to/your/robowin")
+robowin_root = Path("/cpfs01/projects-HDD/cfff-377aad6b032c_HDD/chenshuai/wenxuan/mta/RoboTwin")
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -27,7 +28,8 @@ from datetime import datetime
 import importlib
 import argparse
 import pdb
-from evaluation.robotwin.geometry import euler2quat
+# from evaluation.robotwin.geometry import euler2quat
+from .geometry import euler2quat
 import numpy as np
 
 from description.utils.generate_episode_instructions import *
@@ -40,8 +42,10 @@ from scipy.spatial.transform import Rotation as R
 import json
 from pathlib import Path
 
-from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
-from evaluation.robotwin.test_render import Sapien_TEST
+# from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
+from .websocket_client_policy import WebsocketClientPolicy
+# from evaluation.robotwin.test_render import Sapien_TEST
+from .test_render import Sapien_TEST
 
 def write_json(data: dict, fpath: Path) -> None:
     """Write data to a JSON file.
@@ -263,8 +267,14 @@ def class_decorator(task_name):
         env_instance = env_class()
     except:
         raise SystemExit("No Task")
+    show_methods(env_instance)
     return env_instance
 
+
+def show_methods(instance):
+    methods = [name for name, obj in inspect.getmembers(instance, inspect.ismethod)]
+    for m in methods:
+        print(m)
 
 def eval_function_decorator(policy_name, model_name):
     try:
@@ -392,7 +402,6 @@ def main(usr_args):
     suc_nums = []
     test_num = usr_args["test_num"]
 
-    
     model = WebsocketClientPolicy(port=usr_args['port'])
 
     st_seed, suc_num = eval_policy(task_name,
@@ -469,15 +478,34 @@ def eval_policy(task_name,
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
+        TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+        TASK_ENV.close_env()
         if expert_check:
             try:
+                print("=" * 80)
+                print("before setup_demo")
+                print("task_name:", task_name)
+                print("now_id:", now_id)
+                print("now_seed:", now_seed)
+                print("is_test:", True)
+                print("args keys:", sorted(list(args.keys())))
+                print("task_config:", args.get("task_config"))
+                print("policy_name:", args.get("policy_name"))
+                print("embodiment:", args.get("embodiment"))
+                print("left_robot_file:", args.get("left_robot_file"))
+                print("right_robot_file:", args.get("right_robot_file"))
+                print("head_camera_type:", args.get("camera", {}).get("head_camera_type"))
+                print("wrist_camera_type:", args.get("camera", {}).get("wrist_camera_type"))
+                print("=" * 80)
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 episode_info = TASK_ENV.play_once()
                 TASK_ENV.close_env()
+                print('finished 1111')
             except UnStableError as e:
                 TASK_ENV.close_env()
                 now_seed += 1
                 args["render_freq"] = render_freq
+                print('finished 2222')
                 continue
             except Exception as e:
                 TASK_ENV.close_env()
@@ -485,6 +513,7 @@ def eval_policy(task_name,
                 args["render_freq"] = render_freq
                 print(f"error occurs ! {e}")
                 traceback.print_exc()
+                print('finished 3333')
                 continue
 
         if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
@@ -563,6 +592,7 @@ def eval_policy(task_name,
                 gen_video_list.append(imagined_video)
             key_frame_list = []
 
+            print('action shape:',action.shape)
             assert action.shape[2] % 4 == 0
             action_per_frame = action.shape[2] // 4
 

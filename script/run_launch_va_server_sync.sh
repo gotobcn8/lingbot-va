@@ -4,7 +4,7 @@ set -x
 
 umask 007
  
-NGPU=${NGPU:-"8"}
+NGPU=${NGPU:-""}
 MASTER_PORT=${MASTER_PORT:-"29501"}
 PORT=${PORT:-"1106"}
 LOG_RANK=${LOG_RANK:-"0"}

@@ -1,7 +1,15 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.datasets.utils import get_episode_data_index
-from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
+from lerobot.datasets.utils import (
+    get_episode_data_index,
+    get_safe_version,
+    hf_transform_to_torch
+)
+import packaging.version
+from lerobot.datasets.compute_stats import (
+    # aggregate_stats, 
+    compute_episode_stats
+)
 import numpy as np
 from pathlib import Path
 from collections.abc import Callable
@@ -14,6 +22,26 @@ from einops import rearrange
 from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
+import pdb
+import datasets
+from datasets import concatenate_datasets, load_dataset
+import pandas as pd
+# from datasets.utils import hf_transform_to_torch
+# from remote_pdb import RemotePdb
+
+ORIGINS = {
+    'action_range':16,
+    'left' : (0,7),
+    'right': (8,15)
+}
+
+MINE_TEST = {
+    'action_range':14,
+    'left' : (0,6),
+    'left_gripper':(6,7),
+    'right': (7,13),
+    'right_gripper':(13,14),
+}
 
 def recursive_find_file(directory, filename='info.json'):
     result = []
@@ -49,10 +77,10 @@ def construct_lerobot_multi_processor(config,
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
     with Pool(num_init_worker) as pool:
         datasets_out_lst = pool.map(construct_func, repo_list)
-                
+
     return datasets_out_lst
 
-def get_relative_pose(pose):
+def get_relative_pose(pose, action_config = None):
     if torch.is_tensor(pose):
         pose = pose.detach().cpu().numpy()
     
@@ -67,7 +95,18 @@ def get_relative_pose(pose):
     relative_pose = np.concatenate([relative_trans, relative_quat], axis=1)
     return torch.from_numpy(relative_pose)
 
+def get_relative_joint_action(action):
+    if torch.is_tensor(action):
+        action = action.detach().cpu().numpy()
+    relative_action = action - action[0:1]
+    return torch.from_numpy(relative_action).float()
+    
+
 class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
+    ''''
+    This dataset is used for multiple datasets concatenation, such as [task1, task2,...]
+    local idx == global_idx in tasks.
+    '''
     def __init__(
         self,
         config,
@@ -105,12 +144,59 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
         local_idx = idx - self.acc_dset_num[self.item_id_to_dataset_id[idx]]
         return cur_dset[local_idx]
 
+
+def aggregate_stats(stats_list: dict[str,dict[str, dict]]) -> dict[str, dict[str, np.ndarray]]:
+    """Aggregate stats from multiple compute_stats outputs into a single set of stats.
+
+    The final stats will have the union of all data keys from each of the stats dicts.
+
+    For instance:
+    - new_min = min(min_dataset_0, min_dataset_1, ...)
+    - new_max = max(max_dataset_0, max_dataset_1, ...)
+    - new_mean = (mean of all data, weighted by counts)
+    - new_std = (std of all data)
+    """
+
+    # _assert_type_and_shape(stats_list)
+
+    # data_keys = {key for stats in stats_list for key in stats}
+    data_keys = {
+        key for key in stats_list[0]
+    }
+    # aggregated_stats = {key: {} for key in data_keys}
+    aggregated_stats = {}
+    stats_list = [
+        stats_list[key] for key in stats_list
+    ]
+    for stats in stats_list:
+        for key, v in stats.items():
+            if key not in aggregated_stats:
+                aggregated_stats[key] = {
+                    "min": np.array(v["min"]),
+                    "max": np.array(v["max"]),
+                    "sum": np.array(v["mean"]) * v["count"],
+                    "sq_sum": (np.array(v["std"])**2 + np.array(v["mean"])**2) * v["count"],
+                    "count": v["count"]
+                }
+            else:
+                aggregated_stats[key]["min"] = np.minimum(aggregated_stats[key]["min"], v["min"])
+                aggregated_stats[key]["max"] = np.maximum(aggregated_stats[key]["max"], v["max"])
+                aggregated_stats[key]["sum"] += np.array(v["mean"]) * v["count"]
+                aggregated_stats[key]["sq_sum"] += (np.array(v["std"])**2 + np.array(v["mean"])**2) * v["count"]
+                aggregated_stats[key]["count"] += v["count"]
+
+    return aggregated_stats
+
 class LatentLeRobotDataset(LeRobotDataset):
     def __init__(
         self,
         repo_id,
         config=None,
+        download_videos = None,
     ):
+        # This is for temporary.
+        self.action_conf = MINE_TEST
+
         self.repo_id = repo_id
         self.root = HF_LEROBOT_HOME / repo_id
         self.image_transforms = None
@@ -128,17 +214,25 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.meta = LeRobotDatasetMetadata(
             self.repo_id, self.root, self.revision, force_cache_sync=False
         )
-        if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
-            episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
-            self.stats = aggregate_stats(episodes_stats)
+        # if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
+        #     episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
+        #     self.stats = aggregate_stats(episodes_stats)
         
+        if self.meta._version >= packaging.version.parse("v2.1"):
+            # episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
+            self.stats = aggregate_stats(self.meta.episodes_stats)
+            self.action_max = np.pad(self.stats['action']['max'], (0, 30 - len(self.stats['action']['max'])), mode='constant')
+            self.action_min = np.pad(self.stats['action']['min'], (0, 30 - len(self.stats['action']['max'])), mode='constant')
+
         try:
             assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
-            self.hf_dataset = self.load_hf_dataset()
+            self.hf_dataset = self.load_hf_dataset_tmp()
+            # self.hf_dataset = self.load_hf_dataset()
         except (AssertionError, FileNotFoundError, NotADirectoryError):
             self.revision = get_safe_version(self.repo_id, self.revision)
             self.download_episodes(download_videos)
             self.hf_dataset = self.load_hf_dataset()
+        # pdb.set_trace()
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         
         self.latent_path = Path(repo_id) / 'latents'
@@ -148,6 +242,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.used_video_keys = config.obs_cam_keys
         self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
         self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
+        
         self._hf_torch_view = self.hf_dataset.with_format(
                 type='torch',
                 columns=['action'],
@@ -155,11 +250,30 @@ class LatentLeRobotDataset(LeRobotDataset):
             )
         self.parse_meta()
 
+    def load_hf_dataset_tmp(self) -> datasets.Dataset:
+        """hf_dataset contains all the observations, states, actions, rewards, etc."""
+        if self.episodes is None:
+            path = str(self.root / "data" / "chunk-000")
+            hf_dataset = load_dataset("parquet", data_dir=path, split="train")
+        else:
+            files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
+            hf_dataset = load_dataset("parquet", data_files=files, split="train")
+
+        # TODO(aliberts): hf_dataset.set_format("torch")
+        hf_dataset.set_transform(hf_transform_to_torch)
+        return hf_dataset
+
     def parse_meta(self):
         out = []
         for key, value in self.meta.episodes.items():
             episode_index = value["episode_index"]
             tasks = value["tasks"]
+            # rank = int(os.environ.get("RANK", 0))
+            # if rank == 0:  # 只在 rank0 停住
+            #     print(f"[Debug] Waiting for remote-PDB on port {4444} ...", flush=True)
+            #     RemotePdb("0.0.0.0", 4444).set_trace()
+            # pdb.set_trace()
+            # print(value.keys())
             action_config = value["action_config"]
             for acfg in action_config:
                 cur_meta = {
@@ -181,8 +295,10 @@ class LatentLeRobotDataset(LeRobotDataset):
     def _check_meta(self, start_frame, end_frame, episode_index):
         episode_chunk = self.meta.get_episode_chunk(episode_index)
         latent_path = Path(self.latent_path) / f"chunk-{episode_chunk:03d}"
+
         for key in self.used_video_keys:
             cur_path = latent_path / key
+            # if 
             latent_file = (
                 cur_path / f"episode_{episode_index:06d}_{start_frame}_{end_frame}.pth"
             )
@@ -216,6 +332,9 @@ class LatentLeRobotDataset(LeRobotDataset):
                 cur_path / f"episode_{episode_index:06d}_{start_frame}_{end_frame}.pth"
             )
             assert os.path.exists(latent_file)
+            # df = pd.read_parquet(latent_file)
+            # latent_data = df.to_dict(orient="records")
+            # latent_data = df.to_dict()
             latent_data = torch.load(latent_file, weights_only=False)
             out[key] = latent_data
         
@@ -254,9 +373,11 @@ class LatentLeRobotDataset(LeRobotDataset):
         act_shift = int(latent_frame_ids[0] - local_start_frame)
         frame_stride = latent_frame_ids[1] - latent_frame_ids[0]
         action = action[act_shift:]
-        left_action = get_relative_pose(action[:, :7])
-        right_action = get_relative_pose(action[:, 8:15])
-        action = np.concatenate([left_action, action[:, 7:8], right_action, action[:, 15:16]], axis=1)
+        # left_action = get_relative_pose(action[:, :self.action_conf['left'][1]])
+        left_action = get_relative_joint_action(action[:, :self.action_conf['left'][1]])
+        # right_action = get_relative_pose(action[:, self.action_conf['right'][0]:self.action_conf['right'][1]])
+        right_action = get_relative_joint_action(action[:, self.action_conf['right'][0]:self.action_conf['right'][1]])
+        action = np.concatenate([left_action, action[:, self.action_conf['left_gripper'][0]:self.action_conf['left_gripper'][1]], right_action, action[:, self.action_conf['right_gripper'][0]:self.action_conf['right_gripper'][1]]], axis=1)
         action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
 
         latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
@@ -270,10 +391,15 @@ class LatentLeRobotDataset(LeRobotDataset):
         action_paded = np.pad(action, ((0, 0), (0, 1)), mode='constant', constant_values=0)
         action_mask_padded = np.pad(action_mask, ((0, 0), (0, 1)), mode='constant', constant_values=0)
 
-        action_aligned = action_paded[:, self.config.inverse_used_action_channel_ids]
+        action_aligned = action_paded[:, self.config.inverse_used_action_channel_ids] # here repeat to dim=30, len(inverse_used_action_channel_ids) = 30
         action_mask_aligned = action_mask_padded[:, self.config.inverse_used_action_channel_ids]
-        action_aligned = (action_aligned - self.q01) / (
-                self.q99 - self.q01 + 1e-6) * 2. - 1.
+        # action_aligned = action_aligned - self.meta.episodes_stats
+        # action_aligned = (action_aligned - self.q01) / (
+        #         self.q99 - self.q01 + 1e-6) * 2. - 1.
+        action_aligned = (action_aligned - self.action_min) / (
+            self.action_max - self.action_min + 1e-6
+        ) * 2. - 1.
+
         action_aligned = rearrange(action_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
         action_mask_aligned = rearrange(action_mask_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
         action_aligned *= action_mask_aligned

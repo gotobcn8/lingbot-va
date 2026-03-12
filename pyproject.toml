@@ -58,4 +58,6 @@ profile = "black"
 [tool.mypy]
 strict = true
 
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
 

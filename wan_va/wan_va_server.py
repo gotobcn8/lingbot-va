@@ -240,6 +240,7 @@ class VA_Server:
         action = action.cpu()  # B, C, F, H, W
 
         action = action[0, ..., 0]  #C, F, H
+        print('*'*29,self.action_norm_method)
         if self.action_norm_method == 'quantiles':
             action = (action + 1) / 2 * (self.actions_q99 - self.actions_q01 +
                                          1e-6) + self.actions_q01

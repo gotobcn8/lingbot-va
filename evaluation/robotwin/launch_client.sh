@@ -1,4 +1,5 @@
 #!/bin/bash
+set -x
 export LD_LIBRARY_PATH=/usr/lib64:/usr/lib:$LD_LIBRARY_PATH
 
 task_groups=(
@@ -22,7 +23,7 @@ seed=0
 PORT=29056
 
 PYTHONWARNINGS=ignore::UserWarning \
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python -m evaluation.robotwin.eval_polict_client_openpi --config policy/$policy_name/deploy_policy.yml \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python -m evaluation.robotwin.eval_polict_client_openpi --config ../RoboTwin/policy/$policy_name/deploy_policy.yml \
     --overrides \
     --task_name ${task_name} \
     --task_config ${task_config} \

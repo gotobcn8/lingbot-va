@@ -39,6 +39,8 @@ def custom_sdpa(q, k, v):
                                          v.transpose(1, 2))
     return out.transpose(1, 2)
 
+MAX_TEXT_LEN = 128
+
 class FlexAttnFunc(nn.Module):
     flex_attn: ClassVar[Callable] = torch.compile(
         flex_attention, dynamic=True, 
@@ -46,6 +48,7 @@ class FlexAttnFunc(nn.Module):
     compiled_create_block_mask: ClassVar[Callable] = torch.compile(create_block_mask)
     attention_mask: ClassVar[BlockMask] = None
     cross_attention_mask: ClassVar[BlockMask] = None
+    
 
     def __init__(
         self, 
@@ -96,6 +99,7 @@ class FlexAttnFunc(nn.Module):
         latent_shape, 
         action_shape, 
         padded_length, 
+        text_active_length,
         chunk_size,
         window_size,
         patch_size,
@@ -132,7 +136,29 @@ class FlexAttnFunc(nn.Module):
             )
         FlexAttnFunc.attention_mask = block_mask
 
-        text_seq_ids = torch.arange(B)[:, None].expand(-1, 512).flatten()
+        if not torch.is_tensor(text_active_length):
+            if isinstance(text_active_length, (list, tuple)):
+                text_active_length = torch.tensor(text_active_length)
+            else:
+                text_active_length = torch.full((B,), int(text_active_length))
+        else:
+            text_active_length = text_active_length.to(device)
+
+        if text_active_length.ndim == 0:
+            text_active_length = text_active_length.repeat(B)
+
+        text_active_length = text_active_length.clamp(min=0, max=MAX_TEXT_LEN)
+
+        # init text_seq_ids
+        text_seq_ids = torch.full((B, MAX_TEXT_LEN), -1)
+
+        for i in range(B):
+            valid_len = int(text_active_length[i].item())
+            text_seq_ids[i, :valid_len] = i
+
+        text_seq_ids = text_seq_ids.flatten()
+        # text_seq_ids = text_seq_ids.flatten()
+        # text_seq_ids = torch.arange(B)[:, None].expand(-1, 128).flatten()
         mask_mod_cross = FlexAttnFunc._get_cross_mask_mod(seq_ids.long().to(device), text_seq_ids.long().to(device))
         block_mask_cross = FlexAttnFunc.compiled_create_block_mask(
                 mask_mod_cross, 1, 1, len(seq_ids), len(text_seq_ids), device=device, _compile=True
@@ -668,6 +694,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                       self.attention_head_dim, device, dtype, batch_size)
     
     def _input_embed(self, latents, input_type='latent'):
+        # shape: (1, 48, 5, 24, 20)
+        # patches (1, 2, 2)
         if input_type == 'latent':
             hidden_states = rearrange(
                 latents,
@@ -708,12 +736,14 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         action_dict = input_dict['action_dict']
         batch_size = latent_dict['noisy_latents'].shape[0]
 
+        # noisy latents
         latent_hidden_states = self._input_embed(latent_dict['noisy_latents'], input_type='latent').flatten(0, 1)[None]
         action_hidden_states = self._input_embed(action_dict['noisy_latents'], input_type='action').flatten(0, 1)[None]
         text_hidden_states = self._input_embed(latent_dict["text_emb"], input_type='text')
 
         text_hidden_states = text_hidden_states.flatten(0, 1)[None]
 
+        # conditional latent
         condition_latent_hidden_states = self._input_embed(latent_dict['latent'], input_type='latent').flatten(0, 1)[None]
         condition_action_hidden_states = self._input_embed(action_dict['latent'], input_type='action').flatten(0, 1)[None]
 
@@ -748,6 +778,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         temb = torch.cat([latent_temb, action_temb], dim=1)
         timestep_proj = torch.cat([latent_timestep_proj, action_timestep_proj], dim=1)
 
+        text_active_length = input_dict.get('text_active_length', MAX_TEXT_LEN)
         total_length = hidden_states.shape[1]
         padded_length = (128 - total_length % 128) % 128
         hidden_states = F.pad(hidden_states, (0, 0, 0, padded_length))
@@ -755,15 +786,25 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         temb = F.pad(temb, (0, 0, 0, padded_length))
         timestep_proj = F.pad(timestep_proj, (0, 0, 0, 0, 0, padded_length))
 
+        # e.g. [360,360,264,264,32]
         split_list = [latent_hidden_states.shape[1], 
                       condition_latent_hidden_states.shape[1], 
                       action_hidden_states.shape[1], 
                       condition_action_hidden_states.shape[1],
                       padded_length]
 
+
+        
+        # noisy_latents: (1,48,3,24,20)
+        # action_dict noisy_latents : (1, 30, 3, 88, 1)
+        # padded_length = 32
+        # chunk_size = 3
+        # window_size = 9
+        # patch_size = [1,2,2]
         FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
                                action_dict['noisy_latents'].shape, 
                                padded_length, 
+                               text_active_length,
                                input_dict["chunk_size"],
                                window_size=input_dict['window_size'],
                                patch_size=self.patch_size,
@@ -771,11 +812,17 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                )
 
         for block in self.blocks:
-            hidden_states = block(hidden_states,
-                                         text_hidden_states,
-                                         timestep_proj,
-                                         rotary_emb,
-                                         update_cache=False)
+            # hidden_states = (1,1280,3072)
+            # text_hidden_states = (1，33，3072)
+            torch.cuda.synchronize()
+            hidden_states = block(
+                hidden_states,
+                text_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                update_cache=False
+            )
+            torch.cuda.synchronize()
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)
@@ -786,9 +833,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                 shift).type_as(hidden_states)
         latent_hidden_states, _, action_hidden_states, _, _ = torch.split(hidden_states, split_list, dim=1)
         latent_hidden_states = self.proj_out(latent_hidden_states)
-        latent_hidden_states = rearrange(latent_hidden_states,
-                                             '1 (b l) (n c) -> b (l n) c',
-                                             n=math.prod(self.patch_size), b=batch_size)  #
+        latent_hidden_states = rearrange(
+            latent_hidden_states,
+            '1 (b l) (n c) -> b (l n) c',
+            n=math.prod(self.patch_size), b=batch_size
+        )  # batch, sequence = l, n = h * w, c = dim
         action_hidden_states = self.action_proj_out(action_hidden_states)
         action_hidden_states = rearrange(action_hidden_states,
                                              '1 (b l) c -> b l c',
@@ -882,6 +931,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
         return latent_hidden_states
 
+    def set_requires_gradient_sync(self,should_asyc = False):
+        if hasattr(self, "require_backward_grad_sync"):
+            self.require_backward_grad_sync = should_asyc
 
 if __name__ == '__main__':
     model = WanTransformer3DModel(patch_size=[1, 2, 2],

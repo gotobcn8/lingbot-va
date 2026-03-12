@@ -6,7 +6,6 @@ transformers==4.55.2
 accelerate
 einops
 easydict
-flash_attn
 numpy==1.26.4
 tqdm
 imageio[ffmpeg]
@@ -17,8 +16,9 @@ matplotlib
 ftfy
 safetensors
 Pillow
+flash_attn
 
 # Post-training
-lerobot==0.3.3
+# lerobot==0.3.3
 scipy
 wandb

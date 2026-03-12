@@ -40,12 +40,13 @@ from utils import (
     sample_timestep_id,
     data_seq_to_patch,
     warmup_constant_lambda,
-    FlowMatchScheduler
+    FlowMatchScheduler,
+    collate_get_mask
 )
 
 from dataset import MultiLatentLeRobotDataset
 import gc
-
+from remote_pdb import RemotePdb
 
 class Trainer:
     def __init__(self, config):
@@ -132,7 +133,31 @@ class Trainer:
             shuffle=(train_sampler is None), 
             num_workers=config.load_worker,
             sampler=train_sampler,
+            # collate_fn = collate_get_mask,
         )
+
+        # if config.world_size > 1:
+        #     train_sampler = DistributedSampler(
+        #         train_dataset,
+        #         num_replicas=config.world_size,
+        #         rank=config.rank,
+        #         shuffle=True,
+        #         seed=42,
+        #     )
+
+        #     self.train_loader = DataLoader(
+        #         train_dataset,
+        #         batch_size=config.batch_size,
+        #         sampler=train_sampler,
+        #         num_workers=config.load_worker,
+        #     )
+        # else:
+        #     self.train_loader = DataLoader(
+        #         train_dataset,
+        #         batch_size=config.batch_size,
+        #         shuffle=True,
+        #         num_workers=config.load_worker,
+        #     )
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_latent.set_timesteps(1000, training=True)
@@ -199,7 +224,7 @@ class Trainer:
         )
 
     @torch.no_grad()
-    def _prepare_input_dict(self, batch_dict):
+    def _prepare_input_dict(self, batch_dict, config):
         """Prepare input dict following infer code pattern from wan_va_server.py."""
         # Generate grid_id following infer code (no batch dimension yet)
         # For action mode: get_mesh_id(shape[-3], shape[-2], shape[-1], t=1, f_w=1, f_shift, action=True)
@@ -217,6 +242,19 @@ class Trainer:
             action_mode=True,
             noisy_cond_prob=0.0)
 
+        # batch_dict['text_embed_real'] = batch_dict['text_emb']
+        B, T, D = batch_dict['text_emb'].shape
+        if T < config.max_tokens:
+            batch_dict['text_emb'] = F.pad(
+                batch_dict['text_emb'],
+                (0, 0, 0, config.max_tokens - T),  # (D_left, D_right, T_left, T_right)
+            )
+        if B == 1:
+            batch_dict['text_active_length'] = T
+        if batch_dict['text_emb'].dtype != torch.bfloat16:
+            batch_dict['text_emb'] = batch_dict['text_emb'].to(torch.bfloat16)
+        if D != 4096:
+            return False
         latent_dict['text_emb'] = batch_dict['text_emb']
         action_dict['text_emb'] = batch_dict['text_emb']
         action_dict['actions_mask'] = batch_dict['actions_mask']
@@ -226,6 +264,7 @@ class Trainer:
             'action_dict': action_dict,
             'chunk_size': torch.randint(1, 5, (1,)).item(),
             'window_size': torch.randint(4, 65, (1,)).item(),
+            'text_active_length': batch_dict['text_active_length'],
         }
         return input_dict
 
@@ -284,7 +323,7 @@ class Trainer:
             total=len(self.train_loader),
             desc="Training",
             disable=(self.config.rank != 0),
-            leave=True,
+            leave=True, 
             dynamic_ncols=True
         )
 
@@ -292,12 +331,16 @@ class Trainer:
         accumulated_latent_losses = []
         accumulated_action_losses = []
 
+        tmp_idx = 0
         for batch_idx, batch in enumerate(self.train_loader):
             batch = self.convert_input_format(batch)
 
-            input_dict = self._prepare_input_dict(batch)
-
-            should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(self.train_loader)
+            input_dict = self._prepare_input_dict(batch,self.config)
+            if isinstance(input_dict,bool) and not input_dict:
+                continue
+            
+            # should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(self.train_loader)
+            should_sync = (tmp_idx + 1) % self.gradient_accumulation_steps == 0 or (tmp_idx + 1) == len(self.train_loader)
             
             if not should_sync:
                 self.transformer.set_requires_gradient_sync(False)
@@ -362,6 +405,7 @@ class Trainer:
                     if self.config.rank == 0:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
+            tmp_idx += 1
 
         progress_bar.close()
 
@@ -470,13 +514,19 @@ class Trainer:
 
 def run(args):
     """Main entry point."""
-    config = VA_CONFIGS[args.config_name]
+    config = VA_CONFIGS[args.config_name] # datasets
 
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-    init_distributed(world_size, local_rank, rank)
+    if world_size > 1:
+        init_distributed(world_size, local_rank, rank)
+    else:
+        # 单进程：确保当前卡设置好
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+    # init_distributed(world_size, local_rank, rank)
 
     config.rank = rank
     config.local_rank = local_rank

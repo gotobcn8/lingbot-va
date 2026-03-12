@@ -46,12 +46,13 @@ class Sapien_TEST(gym.Env):
     def __init__(self):
         super().__init__()
         ta.setup_logging("CRITICAL")  # hide logging
-        try:
-            self.setup_scene()
-            print("\033[32m" + "Render Well" + "\033[0m")
-        except:
-            print("\033[31m" + "Render Error" + "\033[0m")
-            exit()
+        self.setup_scene()
+        # try:
+        #     self.setup_scene()
+        #     print("\033[32m" + "Render Well" + "\033[0m")
+        # except:
+        #     print("\033[31m" + "Render Error" + "\033[0m")
+        #     exit()
 
     def setup_scene(self, **kwargs):
         """
@@ -63,15 +64,18 @@ class Sapien_TEST(gym.Env):
         from sapien.render import set_global_config
 
         set_global_config(max_num_materials=50000, max_num_textures=50000)
-        self.renderer = sapien.SapienRenderer()
+        print('111')
+        self.renderer = sapien.SapienRenderer(offscreen_only=True)
         # give renderer to sapien sim
+        print('ooo')
         self.engine.set_renderer(self.renderer)
 
+        print('222')
         sapien.render.set_camera_shader_dir("rt")
         sapien.render.set_ray_tracing_samples_per_pixel(32)
         sapien.render.set_ray_tracing_path_depth(8)
         sapien.render.set_ray_tracing_denoiser("oidn")
-
+        print('333')
         # declare sapien scene
         scene_config = sapien.SceneConfig()
         self.scene = self.engine.create_scene(scene_config)
