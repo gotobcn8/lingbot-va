@@ -1,6 +1,6 @@
 train_out/*
 .venv/*
 **/__pycache__/** */
-**/logs/** */
+*.log
 visualization/**
 *.pyc

@@ -1,8 +1,0 @@
-Traceback (most recent call last):
-  File "/cpfs01/projects-HDD/cfff-377aad6b032c_HDD/chenshuai/miniconda3/envs/lingbot/lib/python3.10/runpy.py", line 196, in _run_module_as_main
-    return _run_code(code, main_globals, None,
-  File "/cpfs01/projects-HDD/cfff-377aad6b032c_HDD/chenshuai/miniconda3/envs/lingbot/lib/python3.10/runpy.py", line 86, in _run_code
-    exec(code, run_globals)
-  File "/cpfs01/projects-HDD/cfff-377aad6b032c_HDD/chenshuai/wenxuan/mta/lingbot-va/evaluation/robotwin/eval_polict_client_openpi.py", line 15, in <module>
-    os.chdir(robowin_root)
-FileNotFoundError: [Errno 2] No such file or directory: '/path/to/your/robowin'
