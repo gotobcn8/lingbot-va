@@ -26,6 +26,8 @@ import pdb
 import datasets
 from datasets import concatenate_datasets, load_dataset
 import pandas as pd
+# from evaluation.robotwin.geometry import euler2quat
+from utils.geometry import euler2quat
 # from datasets.utils import hf_transform_to_torch
 # from remote_pdb import RemotePdb
 
@@ -212,17 +214,18 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.episode_buffer = None
         self.root.mkdir(exist_ok=True, parents=True)
         self.meta = LeRobotDatasetMetadata(
-            self.repo_id, self.root, self.revision, force_cache_sync=False
+            self.repo_id, self.root, self.revision, force_cache_sync
+            =False
         )
-        # if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
-        #     episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
-        #     self.stats = aggregate_stats(episodes_stats)
+        if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
+            episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
+            self.stats = aggregate_stats(episodes_stats)
         
-        if self.meta._version >= packaging.version.parse("v2.1"):
-            # episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
-            self.stats = aggregate_stats(self.meta.episodes_stats)
-            self.action_max = np.pad(self.stats['action']['max'], (0, 30 - len(self.stats['action']['max'])), mode='constant')
-            self.action_min = np.pad(self.stats['action']['min'], (0, 30 - len(self.stats['action']['max'])), mode='constant')
+        # if self.meta._version >= packaging.version.parse("v2.1"):
+        #     # episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
+        #     self.stats = aggregate_stats(self.meta.episodes_stats)
+        #     self.action_max = np.pad(self.stats['action']['max'], (0, 30 - len(self.stats['action']['max'])), mode='constant')
+        #     self.action_min = np.pad(self.stats['action']['min'], (0, 30 - len(self.stats['action']['max'])), mode='constant')
 
         try:
             assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
@@ -369,7 +372,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         )
         return out_dict
     
-    def _action_post_process(self, local_start_frame, local_end_frame, latent_frame_ids, action):
+    def _action_post_process14(self, local_start_frame, local_end_frame, latent_frame_ids, action):
         act_shift = int(latent_frame_ids[0] - local_start_frame)
         frame_stride = latent_frame_ids[1] - latent_frame_ids[0]
         action = action[act_shift:]
@@ -400,6 +403,98 @@ class LatentLeRobotDataset(LeRobotDataset):
             self.action_max - self.action_min + 1e-6
         ) * 2. - 1.
 
+        action_aligned = rearrange(action_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
+        action_mask_aligned = rearrange(action_mask_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
+        action_aligned *= action_mask_aligned
+        return torch.from_numpy(action_aligned).float(), torch.from_numpy(action_mask_aligned).bool()
+
+    def _action_post_process_abandon(self, local_start_frame, local_end_frame, latent_frame_ids, action):
+        act_shift = int(latent_frame_ids[0] - local_start_frame)
+        frame_stride = latent_frame_ids[1] - latent_frame_ids[0]
+        action = action[act_shift:]
+        if self.config.env_type == 'robotwin_tshape': ## TODO support get_relative_pose for other dataset, currently only support robotwin 
+            left_action = get_relative_pose(action[:, :7])
+            right_action = get_relative_pose(action[:, 8:15])
+            action = np.concatenate([left_action, action[:, 7:8], right_action, action[:, 15:16]], axis=1)
+        action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
+
+        latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
+        required_action_num = latent_frame_num * frame_stride * 4
+
+        action = action[:required_action_num]
+        action_mask = np.ones_like(action, dtype='bool')
+        assert action.shape[0] == required_action_num
+
+
+        action_paded = np.pad(action, ((0, 0), (0, 1)), mode='constant', constant_values=0)
+        action_mask_padded = np.pad(action_mask, ((0, 0), (0, 1)), mode='constant', constant_values=0)
+
+        action_aligned = action_paded[:, self.config.inverse_used_action_channel_ids]
+        action_mask_aligned = action_mask_padded[:, self.config.inverse_used_action_channel_ids]
+        action_aligned = (action_aligned - self.q01) / (
+                self.q99 - self.q01 + 1e-6) * 2. - 1.
+        action_aligned = rearrange(action_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
+        action_mask_aligned = rearrange(action_mask_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
+        action_aligned *= action_mask_aligned
+        return torch.from_numpy(action_aligned).float(), torch.from_numpy(action_mask_aligned).bool()
+
+    def action14_to_action16(self, action):
+        """
+        action: (F, 14)
+        return: (F, 16)
+
+        output order:
+        [left_xyz(3), left_quat(4), left_grip(1),
+        right_xyz(3), right_quat(4), right_grip(1)]
+        """
+        action = np.asarray(action)
+        assert action.ndim == 2 and action.shape[1] == 14
+
+        out = []
+        for a in action:
+            lq = euler2quat(a[3], a[4], a[5])      # (4,)
+            rq = euler2quat(a[10], a[11], a[12])   # (4,)
+
+            a16 = np.concatenate([
+                a[:3],      # left xyz
+                lq,         # left quat
+                a[6:7],     # left grip
+                a[7:10],    # right xyz
+                rq,         # right quat
+                a[13:14],   # right grip
+            ], axis=0)
+
+            out.append(a16)
+
+        return np.stack(out, axis=0)
+
+    def _action_post_process(self, local_start_frame, local_end_frame, latent_frame_ids, action):
+        if action.shape[1] == 14:
+            action = self.action14_to_action16(action)
+        act_shift = int(latent_frame_ids[0] - local_start_frame)
+        frame_stride = latent_frame_ids[1] - latent_frame_ids[0]
+        action = action[act_shift:]
+        if self.config.env_type == 'robotwin_tshape': ## TODO support get_relative_pose for other dataset, currently only support robotwin 
+            left_action = get_relative_pose(action[:, :7])
+            right_action = get_relative_pose(action[:, 8:15])
+            action = np.concatenate([left_action, action[:, 7:8], right_action, action[:, 15:16]], axis=1)
+        action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
+
+        latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
+        required_action_num = latent_frame_num * frame_stride * 4
+
+        action = action[:required_action_num]
+        action_mask = np.ones_like(action, dtype='bool')
+        assert action.shape[0] == required_action_num
+
+
+        action_paded = np.pad(action, ((0, 0), (0, 1)), mode='constant', constant_values=0)
+        action_mask_padded = np.pad(action_mask, ((0, 0), (0, 1)), mode='constant', constant_values=0)
+
+        action_aligned = action_paded[:, self.config.inverse_used_action_channel_ids]
+        action_mask_aligned = action_mask_padded[:, self.config.inverse_used_action_channel_ids]
+        action_aligned = (action_aligned - self.q01) / (
+                self.q99 - self.q01 + 1e-6) * 2. - 1.
         action_aligned = rearrange(action_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
         action_mask_aligned = rearrange(action_mask_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
         action_aligned *= action_mask_aligned

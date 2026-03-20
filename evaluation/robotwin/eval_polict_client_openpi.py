@@ -323,7 +323,7 @@ def main(usr_args):
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
     args["save_root"] = save_root
-
+    print(args)
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
 
@@ -478,8 +478,8 @@ def eval_policy(task_name,
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
-        TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-        TASK_ENV.close_env()
+        # TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+        # TASK_ENV.close_env()
         if expert_check:
             try:
                 print("=" * 80)
@@ -611,6 +611,7 @@ def eval_policy(task_name,
                             euler2quat(ee_action[10], ee_action[11], ee_action[12]),
                             ee_action[13:14]
                         ])
+                        print(ee_action)
                     elif action.shape[0] == 16:
                         ee_action =  add_init_pose(ee_action, inint_eef_pose)
                         ee_action = np.concatenate([

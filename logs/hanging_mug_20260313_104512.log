@@ -1,0 +1,151 @@
+Traceback (most recent call last):
+  File "/cpfs01/projects-HDD/cfff-377aad6b032c_HDD/chenshuai/miniconda3/envs/lbva/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/cpfs01/projects-HDD/cfff-377aad6b032c_HDD/chenshuai/miniconda3/envs/lbva/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/cpfs01/projects-HDD/cfff-377aad6b032c_HDD/chenshuai/wenxuan/mta/lingbot-va/evaluation/robotwin/eval_polict_client_openpi.py", line 725, in <module>
+    main(usr_args)
+  File "/cpfs01/projects-HDD/cfff-377aad6b032c_HDD/chenshuai/wenxuan/mta/lingbot-va/evaluation/robotwin/eval_polict_client_openpi.py", line 407, in main
+    st_seed, suc_num = eval_policy(task_name,
+  File "/cpfs01/projects-HDD/cfff-377aad6b032c_HDD/chenshuai/wenxuan/mta/lingbot-va/evaluation/robotwin/eval_polict_client_openpi.py", line 634, in eval_policy
+    model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
+  File "/cpfs01/projects-HDD/cfff-377aad6b032c_HDD/chenshuai/wenxuan/mta/lingbot-va/evaluation/robotwin/websocket_client_policy.py", line 65, in infer
+    response = self._ws.recv()
+  File "/home/chenshuai/.local/lib/python3.10/site-packages/websockets/sync/connection.py", line 336, in recv
+    raise self.protocol.close_exc from self.recv_exc
+websockets.exceptions.ConnectionClosedError: no close frame received or sent
+111
+ooo
+222
+333
+============= Config =============
+
+[95mMessy Table:[0m False
+[95mRandom Background:[0m False
+[95mRandom Light:[0m False
+[95mRandom Table Height:[0m 0
+[95mRandom Head Camera Distance:[0m 0
+[94mHead Camera Config:[0m D435, True
+[94mWrist Camera Config:[0m D435, True
+[94mEmbodiment Config:[0m aloha-agilex
+
+==================================
+missing pytorch3d
+__class_getitem__
+__enter__
+__exit__
+__init__
+__init_subclass__
+__str__
+_default_choose_grasp_pose
+_del_eval_video_ffmpeg
+_init_task_env_
+_print_all_grasp_pose_of_contact_points
+_set_eval_video_ffmpeg
+_take_picture
+_update_render
+add_prohibit_area
+back_to_origin
+check_actors_contact
+check_stable
+check_success
+choose_best_pose
+choose_grasp_pose
+close
+close_env
+close_gripper
+create_table_and_wall
+delay
+get_arm_pose
+get_cluttered_table
+get_grasp_pose
+get_gripper_actor_contact_position
+get_instruction
+get_obs
+get_place_pose
+get_scene_contact
+get_wrapper_attr
+grasp_actor
+is_left_gripper_close
+is_left_gripper_open
+is_left_gripper_open_half
+is_right_gripper_close
+is_right_gripper_open
+is_right_gripper_open_half
+left_move_to_pose
+load_actors
+load_camera
+load_robot
+load_tran_data
+merge_pkl_to_hdf5_video
+move
+move_by_displacement
+move_to_pose
+open_gripper
+place_actor
+play_once
+remove_data_cache
+render
+reset
+right_move_to_pose
+save_camera_images
+save_camera_rgb
+save_traj_data
+set_gripper
+set_instruction
+set_path_lst
+setup_demo
+setup_scene
+step
+take_action
+take_dense_action
+together_close_gripper
+together_move_to_pose
+together_open_gripper
+[34mTask Name: hanging_mug[0m
+[34mPolicy Name: ACT[0m
+================================================================================
+before setup_demo
+task_name: hanging_mug
+now_id: 0
+now_seed: 10000
+is_test: True
+args keys: ['camera', 'ckpt_setting', 'clear_cache_freq', 'collect_data', 'data_type', 'domain_randomization', 'dual_arm_embodied', 'embodiment', 'episode_num', 'eval_mode', 'eval_video_log', 'eval_video_save_dir', 'head_camera_h', 'head_camera_w', 'language_num', 'left_embodiment_config', 'left_robot_file', 'pcd_crop', 'pcd_down_sample_num', 'policy_name', 'render_freq', 'right_embodiment_config', 'right_robot_file', 'save_freq', 'save_path', 'save_root', 'task_config', 'task_name', 'use_seed']
+task_config: demo_clean
+policy_name: ACT
+embodiment: ['aloha-agilex']
+left_robot_file: ./assets/embodiments/aloha-agilex/
+right_robot_file: ./assets/embodiments/aloha-agilex/
+head_camera_type: D435
+wrist_camera_type: D435
+================================================================================
+Warp DeprecationWarning: The namespace `warp.torch` will soon be removed from the public API. It can still be accessed from `warp._src.torch` but might be changed or removed without notice.
+Warp DeprecationWarning: The symbol `warp.torch.device_from_torch` will soon be removed from the public API. Use `warp.device_from_torch` instead.
+exists: True
+exists: True
+exists: True
+exists: True
+finished 1111
+================================================================================
+before setup_demo
+task_name: hanging_mug
+now_id: 0
+now_seed: 10001
+is_test: True
+args keys: ['camera', 'ckpt_setting', 'clear_cache_freq', 'collect_data', 'data_type', 'domain_randomization', 'dual_arm_embodied', 'embodiment', 'episode_num', 'eval_mode', 'eval_video_log', 'eval_video_save_dir', 'head_camera_h', 'head_camera_w', 'language_num', 'left_embodiment_config', 'left_robot_file', 'pcd_crop', 'pcd_down_sample_num', 'policy_name', 'render_freq', 'right_embodiment_config', 'right_robot_file', 'save_freq', 'save_path', 'save_root', 'task_config', 'task_name', 'use_seed']
+task_config: demo_clean
+policy_name: ACT
+embodiment: ['aloha-agilex']
+left_robot_file: ./assets/embodiments/aloha-agilex/
+right_robot_file: ./assets/embodiments/aloha-agilex/
+head_camera_type: D435
+wrist_camera_type: D435
+================================================================================
+finished 1111
+action shape: (14, 2, 16)
+step: [92m1 / 900[0mstep: [92m2 / 900[0mstep: [92m3 / 900[0mstep: [92m4 / 900[0mstep: [92m5 / 900[0mstep: [92m6 / 900[0mstep: [92m7 / 900[0mstep: [92m8 / 900[0mstep: [92m9 / 900[0mstep: [92m10 / 900[0mstep: [92m11 / 900[0mstep: [92m12 / 900[0mstep: [92m13 / 900[0mstep: [92m14 / 900[0mstep: [92m15 / 900[0mstep: [92m16 / 900[0maction shape: (14, 2, 16)
+step: [92m17 / 900[0mstep: [92m18 / 900[0mstep: [92m19 / 900[0mstep: [92m20 / 900[0mstep: [92m21 / 900[0mstep: [92m22 / 900[0mstep: [92m23 / 900[0mstep: [92m24 / 900[0mstep: [92m25 / 900[0mstep: [92m26 / 900[0mstep: [92m27 / 900[0mstep: [92m28 / 900[0mstep: [92m29 / 900[0mstep: [92m30 / 900[0mstep: [92m31 / 900[0mstep: [92m32 / 900[0mstep: [92m33 / 900[0mstep: [92m34 / 900[0mstep: [92m35 / 900[0mstep: [92m36 / 900[0mstep: [92m37 / 900[0mstep: [92m38 / 900[0mstep: [92m39 / 900[0mstep: [92m40 / 900[0mstep: [92m41 / 900[0mstep: [92m42 / 900[0mstep: [92m43 / 900[0mstep: [92m44 / 900[0mstep: [92m45 / 900[0mstep: [92m46 / 900[0mstep: [92m47 / 900[0mstep: [92m48 / 900[0maction shape: (14, 2, 16)
+step: [92m49 / 900[0mstep: [92m50 / 900[0mstep: [92m51 / 900[0mstep: [92m52 / 900[0mstep: [92m53 / 900[0mstep: [92m54 / 900[0mstep: [92m55 / 900[0mstep: [92m56 / 900[0mstep: [92m57 / 900[0mstep: [92m58 / 900[0mstep: [92m59 / 900[0mstep: [92m60 / 900[0mstep: [92m61 / 900[0mstep: [92m62 / 900[0mstep: [92m63 / 900[0mstep: [92m64 / 900[0mstep: [92m65 / 900[0mstep: [92m66 / 900[0mstep: [92m67 / 900[0mstep: [92m68 / 900[0mstep: [92m69 / 900[0mstep: [92m70 / 900[0mstep: [92m71 / 900[0mstep: [92m72 / 900[0mstep: [92m73 / 900[0mstep: [92m74 / 900[0mstep: [92m75 / 900[0mstep: [92m76 / 900[0mstep: [92m77 / 900[0mstep: [92m78 / 900[0mstep: [92m79 / 900[0mstep: [92m80 / 900[0maction shape: (14, 2, 16)
+step: [92m81 / 900[0mstep: [92m82 / 900[0mstep: [92m83 / 900[0mstep: [92m84 / 900[0mstep: [92m85 / 900[0mstep: [92m86 / 900[0mstep: [92m87 / 900[0mstep: [92m88 / 900[0mstep: [92m89 / 900[0mstep: [92m90 / 900[0mstep: [92m91 / 900[0mstep: [92m92 / 900[0mstep: [92m93 / 900[0mstep: [92m94 / 900[0mstep: [92m95 / 900[0mstep: [92m96 / 900[0mstep: [92m97 / 900[0mstep: [92m98 / 900[0mstep: [92m99 / 900[0mstep: [92m100 / 900[0mstep: [92m101 / 900[0mstep: [92m102 / 900[0mstep: [92m103 / 900[0mstep: [92m104 / 900[0mstep: [92m105 / 900[0mstep: [92m106 / 900[0mstep: [92m107 / 900[0mstep: [92m108 / 900[0mstep: [92m109 / 900[0mstep: [92m110 / 900[0mstep: [92m111 / 900[0mstep: [92m112 / 900[0maction shape: (14, 2, 16)
+step: [92m113 / 900[0mstep: [92m114 / 900[0mstep: [92m115 / 900[0mstep: [92m116 / 900[0mstep: [92m117 / 900[0mstep: [92m118 / 900[0mstep: [92m119 / 900[0mstep: [92m120 / 900[0mstep: [92m121 / 900[0mstep: [92m122 / 900[0mstep: [92m123 / 900[0mstep: [92m124 / 900[0mstep: [92m125 / 900[0mstep: [92m126 / 900[0mstep: [92m127 / 900[0mstep: [92m128 / 900[0mstep: [92m129 / 900[0mstep: [92m130 / 900[0mstep: [92m131 / 900[0mstep: [92m132 / 900[0mstep: [92m133 / 900[0mstep: [92m134 / 900[0mstep: [92m135 / 900[0mstep: [92m136 / 900[0mstep: [92m137 / 900[0mstep: [92m138 / 900[0mstep: [92m139 / 900[0mstep: [92m140 / 900[0mstep: [92m141 / 900[0mstep: [92m142 / 900[0mstep: [92m143 / 900[0mstep: [92m144 / 900[0maction shape: (14, 2, 16)
+step: [92m145 / 900[0mstep: [92m146 / 900[0mstep: [92m147 / 900[0mstep: [92m148 / 900[0mstep: [92m149 / 900[0mstep: [92m150 / 900[0mstep: [92m151 / 900[0mstep: [92m152 / 900[0mstep: [92m153 / 900[0mstep: [92m154 / 900[0mstep: [92m155 / 900[0mstep: [92m156 / 900[0mstep: [92m157 / 900[0mstep: [92m158 / 900[0mstep: [92m159 / 900[0mstep: [92m160 / 900[0mstep: [92m161 / 900[0mstep: [92m162 / 900[0mstep: [92m163 / 900[0mstep: [92m164 / 900[0mstep: [92m165 / 900[0mstep: [92m166 / 900[0mstep: [92m167 / 900[0mstep: [92m168 / 900[0mstep: [92m169 / 900[0mstep: [92m170 / 900[0mstep: [92m171 / 900[0mstep: [92m172 / 900[0mstep: [92m173 / 900[0mstep: [92m174 / 900[0mstep: [92m175 / 900[0mstep: [92m176 / 900[0m

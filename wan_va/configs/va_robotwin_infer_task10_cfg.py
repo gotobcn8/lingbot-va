@@ -16,6 +16,9 @@ va_robotwin_train_cfg.load_worker = 0 # for multiprocesses
 va_robotwin_train_cfg.save_interval = 2000
 va_robotwin_train_cfg.gc_interval = 50
 va_robotwin_train_cfg.cfg_prob = 0.1
+va_robotwin_train_cfg.vae_path = os.path.join(va_robotwin_train_cfg.home_path, '.cache/modelscope/Robbyant/lingbot-va-base')
+va_robotwin_train_cfg.text_model_path = os.path.join(va_robotwin_train_cfg.home_path, '.cache/modelscope/Robbyant/lingbot-va-base')
+# va_robotwin_train_cfg.wan22_pretrained_model_name_or_path = os.path.join(va_robotwin_train_cfg.home_path, 'mta/lingbot-va/train_out/checkpoints/checkpoint_step_20000')
 va_robotwin_train_cfg.wan22_pretrained_model_name_or_path = os.path.join(va_robotwin_train_cfg.home_path, '.cache/modelscope/Robbyant/lingbot-va-base')
 
 # Training parameters
@@ -31,3 +34,19 @@ va_robotwin_train_cfg.num_steps = 20000
 # others
 va_robotwin_train_cfg.max_tokens = 128
 # va_robotwin_train_cfg.action_norm_method = 'quantiles'
+
+va_robotwin_train_cfg.action_max = [5.68151522, 3.45788741, 3.66244769, 1.78976679, 1.56326973,
+       1.77522206, 1.        , 1.26083982, 3.24260497, 3.6588552 ,
+       1.89039254, 1.28473699, 3.15973711, 1.        , 0.        ,
+       0.        , 0.        , 0.        , 0.        , 0.        ,
+       0.        , 0.        , 0.        , 0.        , 0.        ,
+       0.        , 0.        , 0.        , 0.        , 0.        ]
+
+va_robotwin_train_cfg.action_min = [-6.37791872e+00, -3.16402118e-04, -2.96088438e-02, -1.92681313e+00,
+       -1.42168283e+00, -6.23234034e+00,  0.00000000e+00, -6.31657696e+00,
+       -4.66045767e-01, -1.64696306e-03, -1.98937869e+00, -1.37959743e+00,
+       -6.26952934e+00,  0.00000000e+00,  0.00000000e+00,  0.00000000e+00,
+        0.00000000e+00,  0.00000000e+00,  0.00000000e+00,  0.00000000e+00,
+        0.00000000e+00,  0.00000000e+00,  0.00000000e+00,  0.00000000e+00,
+        0.00000000e+00,  0.00000000e+00,  0.00000000e+00,  0.00000000e+00,
+        0.00000000e+00,  0.00000000e+00]

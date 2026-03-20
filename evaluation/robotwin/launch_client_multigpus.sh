@@ -12,7 +12,7 @@ model_name=0
 seed=${3:-0}
 test_num=${4:-100}
 start_port=29556 
-num_gpus=8
+num_gpus=3
 
 task_list_id=${2:-0}
 

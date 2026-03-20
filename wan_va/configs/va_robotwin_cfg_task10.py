@@ -9,13 +9,13 @@ va_robotwin_cfg.update(va_shared_cfg)
 va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/path/to/pretrained/model"
 
 va_robotwin_cfg.attn_window = 72
-va_robotwin_cfg.frame_chunk_size = 2
+va_robotwin_cfg.frame_chunk_size = 4
 va_robotwin_cfg.env_type = 'robotwin_tshape'
 
 va_robotwin_cfg.height = 256
 va_robotwin_cfg.width = 320
 va_robotwin_cfg.action_dim = 30
-va_robotwin_cfg.action_per_frame = 14
+va_robotwin_cfg.action_per_frame = 16
 va_robotwin_cfg.obs_cam_keys = [
     'observation.images.cam_high', 'observation.images.cam_left_wrist',
     'observation.images.cam_right_wrist'
@@ -30,7 +30,9 @@ va_robotwin_cfg.action_num_inference_steps = 50
 va_robotwin_cfg.snr_shift = 5.0
 va_robotwin_cfg.action_snr_shift = 1.0
 
-va_robotwin_cfg.used_action_channel_ids = list(range(14))
+# va_robotwin_cfg.used_action_channel_ids = list(range(14))
+va_robotwin_cfg.used_action_channel_ids = list(range(0, 7)) + list(
+    range(28, 29)) + list(range(7, 14)) + list(range(29, 30))
 
 inverse_used_action_channel_ids = [
     len(va_robotwin_cfg.used_action_channel_ids)
@@ -41,8 +43,8 @@ for i, j in enumerate(va_robotwin_cfg.used_action_channel_ids):
 va_robotwin_cfg.inverse_used_action_channel_ids = inverse_used_action_channel_ids
 # [0,1,2,3,4,...,13,14,14,14...14]
 
-# va_robotwin_cfg.action_norm_method = 'quantiles'
-va_robotwin_cfg.action_norm_method = 'stats'
+va_robotwin_cfg.action_norm_method = 'quantiles'
+# va_robotwin_cfg.action_norm_method = 'stats'
 # quantiles
 va_robotwin_cfg.norm_stat = {
     "q01": [

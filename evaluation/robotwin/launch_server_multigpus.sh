@@ -3,13 +3,13 @@ MASTER_PORT=${MASTER_PORT:-29661}
 LOG_DIR='./logs'
 mkdir -p $LOG_DIR
 
-save_root='./visualization/'
+save_root='/cpfs01/projects-HDD/cfff-377aad6b032c_HDD/chenshuai/wenxuan/visualization/mta/visualization'
 mkdir -p $save_root
 
 batch_time=$(date +%Y%m%d_%H%M%S)
 
 
-for i in {0..7}; do  
+for i in {0..2}; do  
     CURRENT_PORT=$((START_PORT + i))
     CURRENT_MASTER_PORT=$((MASTER_PORT + i))
 
@@ -21,7 +21,7 @@ for i in {0..7}; do
         --nproc_per_node 1 \
         --master_port $CURRENT_MASTER_PORT \
         wan_va/wan_va_server.py \
-        --config-name robotwin \
+        --config-name robotwin_infer_task10 \
         --save_root $save_root \
         --port $CURRENT_PORT  > $LOG_FILE 2>&1 &
     sleep 2;

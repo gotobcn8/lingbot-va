@@ -47,6 +47,7 @@ from utils import (
 from dataset import MultiLatentLeRobotDataset
 import gc
 from remote_pdb import RemotePdb
+import torch.multiprocessing as mp
 
 class Trainer:
     def __init__(self, config):
@@ -127,6 +128,7 @@ class Trainer:
             shuffle=True,
             seed=42
         ) if config.world_size > 1 else None
+
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
@@ -519,7 +521,7 @@ def run(args):
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-
+    print(f'-------world_size:{world_size}---------')
     if world_size > 1:
         init_distributed(world_size, local_rank, rank)
     else:
@@ -564,5 +566,7 @@ def main():
 
 
 if __name__ == "__main__":
+
     init_logger()
+    mp.set_start_method("spawn", force=True)
     main()

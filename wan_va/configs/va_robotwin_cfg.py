@@ -32,6 +32,7 @@ va_robotwin_cfg.action_snr_shift = 1.0
 
 va_robotwin_cfg.used_action_channel_ids = list(range(0, 7)) + list(
     range(28, 29)) + list(range(7, 14)) + list(range(29, 30))
+
 inverse_used_action_channel_ids = [
     len(va_robotwin_cfg.used_action_channel_ids)
 ] * va_robotwin_cfg.action_dim

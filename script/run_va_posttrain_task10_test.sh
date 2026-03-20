@@ -28,7 +28,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export TORCHFT_LIGHTHOUSE="${torchft_lighthouse}"
 
-# 只用前3张卡；如果你的目标卡不是0,1,2，就自己改
+# 3 available
 export CUDA_VISIBLE_DEVICES=0,1,2
 
 python -m torch.distributed.run \

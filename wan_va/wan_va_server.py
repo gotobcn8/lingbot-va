@@ -58,20 +58,30 @@ class VA_Server:
         self.action_scheduler.set_timesteps(1000, training=True)
 
         self.vae = load_vae(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'vae'),
+            os.path.join(
+                # job_config.wan22_pretrained_model_name_or_path,
+                job_config.vae_path,
+                'vae'
+            ),
             torch_dtype=self.dtype,
             torch_device=self.device,
         )
         self.streaming_vae = WanVAEStreamingWrapper(self.vae)
 
         self.tokenizer = load_tokenizer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'tokenizer'), )
+            os.path.join(
+                # job_config.wan22_pretrained_model_name_or_path,
+                job_config.text_model_path,
+                'tokenizer'
+            ), 
+        )
 
         self.text_encoder = load_text_encoder(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'text_encoder'),
+            os.path.join(
+                # job_config.wan22_pretrained_model_name_or_path,
+                job_config.text_model_path,
+                'text_encoder'
+            ),
             torch_dtype=self.dtype,
             torch_device=self.device,
         )
@@ -94,12 +104,16 @@ class VA_Server:
         self.streaming_vae_half = None
         if self.env_type == 'robotwin_tshape':
             vae_half = load_vae(
-                os.path.join(job_config.wan22_pretrained_model_name_or_path,
+                os.path.join(
+                    # job_config.wan22_pretrained_model_name_or_path,
+                    job_config.vae_path,
                              'vae'),
                 torch_dtype=self.dtype,
                 torch_device=self.device,
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+        job_config.action_max = torch.tensor(job_config.action_max)
+        job_config.action_min = torch.tensor(job_config.action_min)
 
     def _get_t5_prompt_embeds(
         self,
@@ -232,6 +246,14 @@ class VA_Server:
         if self.action_norm_method == 'quantiles':
             action_model_input = (action_model_input - self.actions_q01) / (
                 self.actions_q99 - self.actions_q01 + 1e-6) * 2. - 1.
+        elif self.action_norm_method == 'stats':
+            # self.action_norm_method == 'quantiles'
+            scale = (self.job_config.action_max - self.job_config.action_min + 1e-6).view(-1,1,1)
+            bias  = self.job_config.action_min.view(-1,1,1)
+            # action_model_input = (action_model_input - self.job_config.action_min) / (
+            #     self.job_config.action_max - self.job_config.action_min + 1e-6
+            # ) * 2. - 1.
+            action_model_input = (action_model_input - bias) / scale * 2. - 1.
         else:
             raise NotImplementedError
         return action_model_input.unsqueeze(0).unsqueeze(-1)  # B, C, F, H, W
@@ -241,11 +263,22 @@ class VA_Server:
 
         action = action[0, ..., 0]  #C, F, H
         print('*'*29,self.action_norm_method)
+        print(action.shape)
         if self.action_norm_method == 'quantiles':
             action = (action + 1) / 2 * (self.actions_q99 - self.actions_q01 +
                                          1e-6) + self.actions_q01
+        elif self.action_norm_method == 'stats':
+            # action = (action + 1) / 2 * (self.job_config.action_max - self.job_config.action_min +
+            #                              1e-6) + self.job_config.action_min
+            
+            scale = (self.job_config.action_max - self.job_config.action_min + 1e-6).view(-1,1,1)
+            bias  = self.job_config.action_min.view(-1,1,1)
+
+            action = (action + 1) / 2 * scale + bias
+
         else:
             raise NotImplementedError
+
         action = action.squeeze(0).detach().cpu().numpy()
         return action[self.job_config.used_action_channel_ids]
     
@@ -288,16 +321,14 @@ class VA_Server:
                 self.prompt_embeds.to(self.dtype).clone(),
             }
             if latent_cond is not None:
-                input_dict['latent_res_lst'][
-                    'noisy_latents'][:, :, 0:1] = latent_cond[:, :, 0:1]
+                input_dict['latent_res_lst']['noisy_latents'][:, :, 0:1] = latent_cond[:, :, 0:1]
                 input_dict['latent_res_lst']['timesteps'][0:1] *= 0
 
         if action_model_input is not None:
             input_dict['action_res_lst'] = {
                 'noisy_latents':
                 action_model_input,
-                'timesteps':
-                torch.ones([action_model_input.shape[2]],
+                'timesteps':torch.ones([action_model_input.shape[2]],
                            dtype=torch.float32,
                            device=self.device) * action_t,
                 'grid_id':
@@ -308,16 +339,13 @@ class VA_Server:
                             1,
                             frame_st_id,
                             action=True).to(self.device),
-                'text_emb':
-                self.prompt_embeds.to(self.dtype).clone(),
+                'text_emb':self.prompt_embeds.to(self.dtype).clone(),
             }
 
             if action_cond is not None:
-                input_dict['action_res_lst'][
-                    'noisy_latents'][:, :, 0:1] = action_cond[:, :, 0:1]
+                input_dict['action_res_lst']['noisy_latents'][:, :, 0:1] = action_cond[:, :, 0:1]
                 input_dict['action_res_lst']['timesteps'][0:1] *= 0
-            input_dict['action_res_lst']['noisy_latents'][:, ~self.
-                                                          action_mask] *= 0
+            input_dict['action_res_lst']['noisy_latents'][:, ~self.action_mask] *= 0
         return input_dict
 
     def _encode_obs(self, obs):
@@ -426,7 +454,8 @@ class VA_Server:
                 num_videos_per_prompt=1,
                 prompt_embeds=None,
                 negative_prompt_embeds=None,
-                max_sequence_length=512,
+                # max_sequence_length=512,
+                max_sequence_length = 128,
                 device=self.device,
                 dtype=self.dtype,
             )
@@ -479,7 +508,7 @@ class VA_Server:
             value=0)
 
         with (
-                torch.no_grad(),
+            torch.no_grad(),
         ):
             # 1. Video Generation Loop
             for i, t in enumerate(tqdm(timesteps)):
