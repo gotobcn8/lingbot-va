@@ -1,0 +1,11 @@
+train_out/*
+.venv/*
+**/__pycache__/** */
+*.log
+visualization/**
+*.pyc
+wandb/*
+*.png
+*.gif
+.idea/*
+.codex
