@@ -341,19 +341,10 @@ class Trainer:
 
         return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps, (alignment_loss * self.trace_coef) / self.gradient_accumulation_steps
 
-    def _compute_loss_grad_norm(self, loss):
-        if not torch.is_tensor(loss) or not loss.requires_grad:
-            return 0.0
-
-        grads = torch.autograd.grad(
-            loss,
-            self.trainable_params,
-            retain_graph=True,
-            allow_unused=True,
-        )
-
+    def _compute_param_grad_norm(self):
         grad_norm_sq = torch.zeros(1, device=self.device, dtype=torch.float32)
-        for grad in grads:
+        for param in self.trainable_params:
+            grad = param.grad
             if grad is None:
                 continue
             grad_norm_sq += grad.detach().float().pow(2).sum()
@@ -363,6 +354,25 @@ class Trainer:
 
         return grad_norm_sq.sqrt().item()
 
+    def _stash_grads(self):
+        stashed_grads = []
+        for param in self.trainable_params:
+            grad = param.grad
+            stashed_grads.append(None if grad is None else grad.detach().clone())
+        return stashed_grads
+
+    def _restore_grads(self, stashed_grads):
+        for param, grad in zip(self.trainable_params, stashed_grads):
+            param.grad = grad
+
+    def _measure_loss_grad_norm(self, loss):
+        if not torch.is_tensor(loss) or not loss.requires_grad:
+            return 0.0
+
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward(retain_graph=True)
+        return self._compute_param_grad_norm()
+
     def _log_loss_grad_norms(self, latent_loss, action_loss, alignment_loss):
         if self.loss_grad_log_interval <= 0:
             return None
@@ -370,9 +380,21 @@ class Trainer:
         if (self.step + 1) % self.loss_grad_log_interval != 0:
             return None
 
-        latent_grad_norm = self._compute_loss_grad_norm(latent_loss)
-        action_grad_norm = self._compute_loss_grad_norm(action_loss)
-        alignment_grad_norm = self._compute_loss_grad_norm(alignment_loss)
+        # Preserve already accumulated grads so the diagnostic backward passes
+        # do not interfere with the real optimizer step.
+        stashed_grads = self._stash_grads()
+        original_sync_state = getattr(self.transformer, "require_backward_grad_sync", None)
+        self.transformer.set_requires_gradient_sync(False)
+        try:
+            latent_grad_norm = self._measure_loss_grad_norm(latent_loss)
+            action_grad_norm = self._measure_loss_grad_norm(action_loss)
+            alignment_grad_norm = self._measure_loss_grad_norm(alignment_loss)
+        finally:
+            self.optimizer.zero_grad(set_to_none=True)
+            self._restore_grads(stashed_grads)
+            if original_sync_state is not None:
+                self.transformer.set_requires_gradient_sync(original_sync_state)
+
         grad_norm_metrics = {
             'grad_metrics/latent_loss_grad_norm': latent_grad_norm,
             'grad_metrics/action_loss_grad_norm': action_grad_norm,
@@ -401,7 +423,7 @@ class Trainer:
         total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
         self.optimizer.step()
         self.lr_scheduler.step()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
         lr = self.lr_scheduler.get_last_lr()[0]
 
@@ -511,7 +533,7 @@ class Trainer:
             dynamic_ncols=True
         )
 
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         accumulated_latent_losses = []
         accumulated_action_losses = []
         accumulated_align_losses = []
