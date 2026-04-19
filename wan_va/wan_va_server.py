@@ -88,7 +88,7 @@ class VA_Server:
         )
 
         modelswitch(os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'transformer'), is_train = False)
+                         'transformer'), is_train = True)
         self.transformer = load_transformer(
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
                          'transformer'),

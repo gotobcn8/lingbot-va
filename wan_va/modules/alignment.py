@@ -25,17 +25,17 @@ def create_future_alignment_mask(F, K, device='cuda'):
 
 def future_alignment_loss(a, b, K=3, Tokens = 192, temperature=1.0, mask_type='window'):
     """
-    计算未来帧对齐损失
+    Future frame alignment
     
     Args:
-        a: (B, Fa, T, D) - 源表征（当前帧）
-        b: (B, Fb, T, D) - 目标表征（未来帧）
-        K: 对齐的未来帧数
-        temperature: 温度系数
-        mask_type: 'triangular' (下三角) 或 'window' (滑动窗口)
+        a: (B, Fa, T, D) - source repr
+        b: (B, Fb, T, D) - target repr ()
+        K: aligned future frames
+        temperature: temperature coef
+        mask_type: 'triangular' (low triangle) or 'window' (slide window)
         
     Returns:
-        loss: 标量损失
+        loss: scalar loss
     """
     # B, Fa, T, D = a.shape
     # _, Fb, _, _ = b.shape
@@ -46,11 +46,11 @@ def future_alignment_loss(a, b, K=3, Tokens = 192, temperature=1.0, mask_type='w
     a = a.reshape(-1, Tokens, D)
     b = b.reshape(-1, Tokens, D)
     Fa, Fb = a.shape[0], b.shape[0]
-    # 1. 归一化特征
+    # 1. normalization feature
     a_norm = F.normalize(a, dim=-1)  # (B, Fa, T, D)
     b_norm = F.normalize(b, dim=-1)  # (B, Fb, T, D)
     
-    # 2. 计算 token-level 相似度矩阵
+    # 2. compute token-level similarity matrix
     # 对每个 batch 独立计算，并考虑 token 对应关系
     # 形状: (B, Fa, T, Fb, T) - 太大会爆内存，改用更高效的方式
     # 由于 B 始终为 1，可以简化
@@ -84,7 +84,7 @@ def future_alignment_loss(a, b, K=3, Tokens = 192, temperature=1.0, mask_type='w
         # a[t] 对齐 b[t+1:t+K+1] (支持 Fa != Fb)
         frame_mask = torch.zeros(Fa, Fb, dtype=torch.bool)
         for i in range(Fa):
-            for j in range(i+1, min(i+K+1, Fb)):
+            for j in range(i, min(i+K, Fb)):
                 frame_mask[i, j] = True
     else:
         raise ValueError(f"Unknown mask_type: {mask_type}")
@@ -121,4 +121,114 @@ def future_alignment_loss(a, b, K=3, Tokens = 192, temperature=1.0, mask_type='w
         loss = 1 - (valid_sims / temperature).mean()
     
     # print(f"frame_mask has {frame_mask.sum().item()} True entries")
+    return loss
+
+def motion_incremental_alignment(
+    a,
+    b,
+    Tokens=192,
+    pool="mean",
+    normalize_before_delta=False,
+    normalize_after_delta=True,
+    eps=1e-8,
+):
+    """
+    Motion incremental alignment via pooled temporal delta.
+
+    Args:
+        a: Tensor, shape (B, F*Tokens, D)
+        b: Tensor, shape (B, F*Tokens, D)
+        Tokens: int, number of tokens per frame/chunk
+        pool: "mean" or "max"
+        normalize_before_delta: whether to normalize pooled frame features before differencing
+        normalize_after_delta: whether to normalize delta features before cosine loss
+        eps: numerical stability
+
+    Returns:
+        loss: scalar
+    """
+    if a.shape != b.shape:
+        raise ValueError(f"a and b must have the same shape, got {a.shape} vs {b.shape}")
+
+    if a.dim() != 3:
+        raise ValueError(f"Expected a and b to be 3D tensors of shape (B, F*Tokens, D), got {a.shape}")
+
+    B, L, D = a.shape
+
+    if L % Tokens != 0:
+        raise ValueError(f"Sequence length {L} is not divisible by Tokens={Tokens}")
+
+    F_steps = L // Tokens
+
+    # (B, F, Tokens, D)
+    a = a.view(B, F_steps, Tokens, D)
+    b = b.view(B, F_steps, Tokens, D)
+
+    # Pool token dimension -> (B, F, D)
+    if pool == "mean":
+        a = a.mean(dim=2)
+        b = b.mean(dim=2)
+    elif pool == "max":
+        a = a.max(dim=2).values
+        b = b.max(dim=2).values
+    else:
+        raise ValueError(f"Unknown pool type: {pool}")
+
+    if normalize_before_delta:
+        a = F.normalize(a, dim=-1, eps=eps)
+        b = F.normalize(b, dim=-1, eps=eps)
+
+    # Temporal delta: (B, F-1, D)
+    delta_a = a[:, 1:] - a[:, :-1]
+    delta_b = b[:, 1:] - b[:, :-1]
+
+    if delta_a.shape[1] == 0:
+        return torch.zeros((), device=a.device, dtype=a.dtype)
+
+    if normalize_after_delta:
+        delta_a = F.normalize(delta_a, dim=-1, eps=eps)
+        delta_b = F.normalize(delta_b, dim=-1, eps=eps)
+
+    # Cosine similarity over delta features
+    cos_sim = (delta_a * delta_b).sum(dim=-1)   # (B, F-1)
+    loss = 1.0 - cos_sim.mean()
+
+    return loss
+
+def motion_incremental_alignment_tokenwise(a, b, Tokens=192, eps=1e-8):
+    """
+    Token-wise motion incremental alignment.
+
+    Args:
+        a, b: (B, F*Tokens, D)
+
+    Returns:
+        loss: scalar
+    """
+    if a.shape != b.shape:
+        raise ValueError(f"a and b must have same shape, got {a.shape} vs {b.shape}")
+
+    B, L, D = a.shape
+    if L % Tokens != 0:
+        raise ValueError(f"Sequence length {L} is not divisible by Tokens={Tokens}")
+
+    F_steps = L // Tokens
+
+    # (B, F, Tokens, D)
+    a = a.view(B, F_steps, Tokens, D)
+    b = b.view(B, F_steps, Tokens, D)
+
+    # temporal delta per token
+    delta_a = a[:, 1:] - a[:, :-1]   # (B, F-1, Tokens, D)
+    delta_b = b[:, 1:] - b[:, :-1]
+
+    if delta_a.shape[1] == 0:
+        return torch.zeros((), device=a.device, dtype=a.dtype)
+
+    delta_a = F.normalize(delta_a, dim=-1, eps=eps)
+    delta_b = F.normalize(delta_b, dim=-1, eps=eps)
+
+    cos_sim = (delta_a * delta_b).sum(dim=-1)   # (B, F-1, Tokens)
+    loss = 1.0 - cos_sim.mean()
+
     return loss

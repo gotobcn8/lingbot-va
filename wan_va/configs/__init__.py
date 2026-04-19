@@ -17,6 +17,8 @@ from .clean.robotwin_va_train import va_robotwin_train_cfg as clean_va_train
 from .clean.robotwin_va_infer import va_robotwin_train_cfg as clean_va_infer
 from .clean.robotwin_ta_train_fromva import va_robotwin_train_cfg as ta_fromva
 from .step2.ta_train_coef import va_robotwin_train_cfg as coef_train
+from .step2.ta_train_motion import va_robotwin_train_cfg as motion_train
+from .step2.ta_infer_motion import va_robotwin_train_cfg as motion_infer
 
 VA_CONFIGS = {
     'robotwin': va_robotwin_cfg,
@@ -37,4 +39,6 @@ VA_CONFIGS = {
     'clean_va_infer':clean_va_infer,
     'ta_fromva':ta_fromva,
     'coef_train':coef_train,
+    'motion_train':motion_train,
+    'motion_infer':motion_infer,
 }

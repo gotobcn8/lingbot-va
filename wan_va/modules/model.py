@@ -181,15 +181,22 @@ class FlexAttnFunc(nn.Module):
         B, _, L_F, L_H, L_W = latent_shape
         _, _, A_F, A_H, A_W = action_shape
 
+        # latent has been patched
         latent_seq_id = torch.arange(B)[:, None, None, None].\
             expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2]).flatten()
         action_seq_id = torch.arange(B)[:, None, None, None].expand(-1, A_F, A_H, A_W).flatten()
+        # Batch size
+        # = batch[0] , seq_id = 0
         seq_ids = torch.cat([latent_seq_id] * 2 + [action_seq_id] * 2)
 
+        # latent frame chunk: even
+        # action frame chunk: odd
+        # simulate: latent0, action0, latent1, action2,....
         latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
         action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
         frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
 
+        # latent noisy (0), latent clean (1), action noisy (0), action clean (1)
         noise_ids = torch.cat(
             [
                 torch.zeros_like(latent_frame_id),
@@ -198,7 +205,7 @@ class FlexAttnFunc(nn.Module):
                 torch.ones_like(action_frame_id),
             ]
         )
-
+        # pad to consistent length
         seq_ids = F.pad(seq_ids, (0, padded_length), value=-1)
         frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
         noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
@@ -228,40 +235,49 @@ class FlexAttnFunc(nn.Module):
     @staticmethod
     @torch.no_grad()
     def _get_mask_mod(seq_ids, frame_ids, noise_ids, window_size):
+        # Same batch, batch[0] = batch[0]
         def seq_mask(
             b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
         ):
             return (seq_ids[q_idx] == seq_ids[kv_idx]) & (seq_ids[q_idx] >=0 ) & (seq_ids[kv_idx] >= 0)
         
+        # past and current frames can be seen
         def block_causal_mask(
             b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
         ):
             return (frame_ids[kv_idx] <= frame_ids[q_idx])
         
+        # Past only
         def block_causal_mask_exclude_self(
             b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
         ):
             return (frame_ids[kv_idx] < frame_ids[q_idx])
         
+        # current chunk only
         def block_self_mask(
             b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
         ):
             return (frame_ids[kv_idx] == frame_ids[q_idx])
         
+        # standard self-attn: clean_q -> clean {<= t}, this cooperate with block_causal_mask
         def clean2clean_mask(
                 b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
         ):
             return (noise_ids[q_idx] == 1) & (noise_ids[kv_idx] == 1)
         
+        # noise can see past clean tokens only
         def noise2clean_mask(
             b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
         ):
             return (noise_ids[q_idx] == 0) & (noise_ids[kv_idx] == 1)
+
+        # noisy -> noisy, can see current noisy token only
         def noise2noise_mask(
             b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
         ):
             return (noise_ids[q_idx] == 0) & (noise_ids[kv_idx] == 0)
         
+        # set a window chunk
         def block_window_mask(
             b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor, window_size: int
         ):
@@ -731,12 +747,24 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 2, inner_dim) / inner_dim**0.5)
     
-    def _init_trace_parameters(self, trace_dim = 4096,data_type = torch.float32):
-        self.trace_hidden_mlp = nn.Linear(
-            trace_dim,
-            self.inner_dim,
-            dtype=data_type,
+    def _init_trace_parameters(self, trace_dim = 4096, target_dim = 2048, K_frames = 1, align_layer = 20,data_type = torch.float32):
+        # self.trace_hidden_mlp = nn.Linear(
+        #     trace_dim,
+        #     c,
+        #     dtype=data_type,
+        # )
+        self.trace_proj = nn.Sequential(
+            nn.Linear(trace_dim, self.inner_dim, dtype=data_type,),
+            nn.GELU(),
+            nn.Linear(self.inner_dim, target_dim, dtype=data_type,)
         )
+        self.align_repr_proj = nn.Sequential(
+            nn.Linear(self.inner_dim, target_dim, dtype=data_type,),
+            nn.GELU(),
+            nn.Linear(target_dim, target_dim, dtype=data_type,),
+        )
+        self.K_frames = K_frames
+        self.align_layer = align_layer
 
     def clear_cache(self, cache_name):
         for block in self.blocks:
@@ -772,8 +800,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             hidden_states = self.action_embedder(hidden_states)
         elif input_type == 'text':
             hidden_states = self.condition_embedder.text_embedder(latents)
-        elif input_type == 'trace':
-            hidden_states = self.trace_hidden_mlp(latents)
+        # elif input_type == 'trace':
+        #     hidden_states = self.trace_hidden_mlp(latents)
         else:
             raise ValueError(f"Unsupported input type: {input_type}")
         return hidden_states
@@ -834,7 +862,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             input_dict['trace'] = input_dict['trace'].to(torch.bfloat16)
             trace_hidden_states, tokens = self.downsample_trace(input_dict['trace'], latent_dict['noisy_latents'].shape[2])
             # 4096 -> 3072
-            trace_hidden_states = self._input_embed(trace_hidden_states, input_type='trace').flatten(0, 1)[None]
+            # trace_hidden_states = self._input_embed(trace_hidden_states, input_type='trace').flatten(0, 1)[None]
 
         hidden_states = torch.cat([latent_hidden_states, 
                                    condition_latent_hidden_states,
@@ -910,7 +938,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 update_cache=False
             )
             torch.cuda.synchronize()
-            if layer == int(len(self.blocks) * 0.75) - 1:
+            if layer == self.align_layer:
                 align_hidden_states, _, _, _, _ = torch.split(hidden_states, split_list, dim=1)
 
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
@@ -936,6 +964,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         # cos_sim = F.cosine_similarity(align_hidden_states, h_new, dim=-1) / temperature
         # loss = 1 - cos_sim.mean()
         if 'trace' in input_dict:
+            align_hidden_states = self.align_repr_proj(align_hidden_states)
+            trace_hidden_states = self.trace_proj(trace_hidden_states)
+            # trace_loss = alignment_module(align_hidden_states, trace_hidden_states, K = self.K_frames, Tokens = tokens)
             trace_loss = alignment_module(align_hidden_states, trace_hidden_states, Tokens = tokens)
             return latent_hidden_states, action_hidden_states, trace_loss
 
@@ -972,10 +1003,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         if train_mode:
             return self.forward_train(input_dict, alignment_module)
         if action_mode:  # action input emb
-            latent_hidden_states = rearrange(input_dict['noisy_latents'],
-                                             'b c f h w -> b (f h w) c')
+            latent_hidden_states = rearrange(input_dict['noisy_latents'], 'b c f h w -> b (f h w) c')
             latent_hidden_states = self.action_embedder(
-                latent_hidden_states)  # B L1 C
+                latent_hidden_states
+            )  # B L1 C
         else:  # latent input emb
             latent_hidden_states = rearrange(
                 input_dict['noisy_latents'],
@@ -1003,16 +1034,17 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
 
         for i, block in enumerate(self.blocks):
-            latent_hidden_states = block(latent_hidden_states,
-                                         text_hidden_states,
-                                         timestep_proj,
-                                         rotary_emb,
-                                         update_cache=update_cache,
-                                         cache_name=cache_name)
+            latent_hidden_states = block(
+                latent_hidden_states,
+                text_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                update_cache=update_cache,
+                cache_name=cache_name
+            )
 
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
-        shift, scale = rearrange(temb_scale_shift_table,
-                                 'b l n c -> b n l c').chunk(2, dim=1)
+        shift, scale = rearrange(temb_scale_shift_table, 'b l n c -> b n l c').chunk(2, dim=1)
         shift = shift.to(latent_hidden_states.device).squeeze(1)
         scale = scale.to(latent_hidden_states.device).squeeze(1)
         latent_hidden_states = (self.norm_out(latent_hidden_states.float()) *

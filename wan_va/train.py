@@ -35,9 +35,9 @@ from modules.utils import (
 )
 
 from modules.alignment import (
-    future_alignment_loss
+    future_alignment_loss,
+    motion_incremental_alignment,
 )
-
 from utils import (
     init_logger, 
     logger, 
@@ -61,6 +61,7 @@ FIRST = True
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
+            keyword = getattr(config, 'keyword', '')
             wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
             self.wandb = wandb
             self.wandb.init(
@@ -69,7 +70,7 @@ class Trainer:
                 # dir=log_dir,
                 config=config,
                 mode="online",
-                name=datetime.now().strftime("%Y%m%d_%H%M%S"),
+                name = f'{keyword}_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
                 # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
             )
             logger.info("WandB logging enabled")
@@ -80,7 +81,9 @@ class Trainer:
         self.patch_size = config.patch_size
         # print(config.max_tokens)
         self.enable_trace = config.enable_trace
-        self.trace_coef = config.trace_coef
+        self.trace_coef = getattr(config, 'trace_coef', 0.05)
+        self.K_frames = getattr(config, 'K_frames', 3)
+        self.align_layer = getattr(config, 'align_layer', 20)
         # Load models
         logger.info("Loading models...")
 
@@ -103,6 +106,8 @@ class Trainer:
         )
         self.transformer._init_trace_parameters(
             data_type = torch.float32,
+            K_frames = self.K_frames,
+            align_layer = self.align_layer
         )
         logger.info("Setting up activation checkpointing ...")
         apply_ac(self.transformer)
@@ -169,11 +174,6 @@ class Trainer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
-        self.loss_grad_log_interval = getattr(
-            config,
-            'loss_grad_log_interval',
-            self.gradient_accumulation_steps,
-        )
         # if hasattr(config, 'resume_from') and config.resume_from:
         #     self._load_training_state(config.resume_from)
     
@@ -341,83 +341,12 @@ class Trainer:
 
         return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps, (alignment_loss * self.trace_coef) / self.gradient_accumulation_steps
 
-    def _compute_param_grad_norm(self):
-        grad_norm_sq = torch.zeros(1, device=self.device, dtype=torch.float32)
-        for param in self.trainable_params:
-            grad = param.grad
-            if grad is None:
-                continue
-            grad_norm_sq += grad.detach().float().pow(2).sum()
-
-        if dist.is_initialized():
-            dist.all_reduce(grad_norm_sq, op=dist.ReduceOp.SUM)
-
-        return grad_norm_sq.sqrt().item()
-
-    def _stash_grads(self):
-        stashed_grads = []
-        for param in self.trainable_params:
-            grad = param.grad
-            stashed_grads.append(None if grad is None else grad.detach().clone())
-        return stashed_grads
-
-    def _restore_grads(self, stashed_grads):
-        for param, grad in zip(self.trainable_params, stashed_grads):
-            param.grad = grad
-
-    def _measure_loss_grad_norm(self, loss):
-        if not torch.is_tensor(loss) or not loss.requires_grad:
-            return 0.0
-
-        self.optimizer.zero_grad(set_to_none=True)
-        loss.backward(retain_graph=True)
-        return self._compute_param_grad_norm()
-
-    def _log_loss_grad_norms(self, latent_loss, action_loss, alignment_loss):
-        if self.loss_grad_log_interval <= 0:
-            return None
-
-        if (self.step + 1) % self.loss_grad_log_interval != 0:
-            return None
-
-        # Preserve already accumulated grads so the diagnostic backward passes
-        # do not interfere with the real optimizer step.
-        stashed_grads = self._stash_grads()
-        original_sync_state = getattr(self.transformer, "require_backward_grad_sync", None)
-        self.transformer.set_requires_gradient_sync(False)
-        try:
-            latent_grad_norm = self._measure_loss_grad_norm(latent_loss)
-            action_grad_norm = self._measure_loss_grad_norm(action_loss)
-            alignment_grad_norm = self._measure_loss_grad_norm(alignment_loss)
-        finally:
-            self.optimizer.zero_grad(set_to_none=True)
-            self._restore_grads(stashed_grads)
-            if original_sync_state is not None:
-                self.transformer.set_requires_gradient_sync(original_sync_state)
-
-        grad_norm_metrics = {
-            'grad_metrics/latent_loss_grad_norm': latent_grad_norm,
-            'grad_metrics/action_loss_grad_norm': action_grad_norm,
-            'grad_metrics/alignment_loss_grad_norm': alignment_grad_norm,
-        }
-
-        if self.config.rank == 0:
-            logger.info(
-                "Loss grad norms at optimizer step %d | latent: %.6f | action: %.6f | alignment: %.6f",
-                self.step + 1,
-                latent_grad_norm,
-                action_grad_norm,
-                alignment_grad_norm,
-            )
-        return grad_norm_metrics
-
     def _finalize_optimizer_step(
         self,
         accumulated_latent_losses,
         accumulated_action_losses,
         accumulated_align_losses,
         progress_bar,
-        loss_grad_norm_metrics,
     ):
         num_accumulated_batches = len(accumulated_latent_losses)
         total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
@@ -446,7 +375,7 @@ class Trainer:
             progress_bar.set_postfix({
                 'latent_loss': f'{latent_loss_show:.5f}',
                 'action_loss': f'{action_loss_show:.5f}',
-                'aligment_loss': f'{alignment_loss_show:.5f}',
+                'alignment_loss': f'{alignment_loss_show:.5f}',
                 'step': self.step,
                 'grad_norm': f'{total_norm.item():.3f}',
                 'lr': f'{lr:.2e}'
@@ -462,8 +391,6 @@ class Trainer:
                     'grad_norm': total_norm.item(),
                     'lr': lr,
                 }
-                if loss_grad_norm_metrics is not None:
-                    wandb_metrics.update(loss_grad_norm_metrics)
                 self.wandb.log(wandb_metrics, step=self.step)
 
         self.step += 1
@@ -488,13 +415,9 @@ class Trainer:
         )
         self.transformer.set_requires_gradient_sync(should_sync)
 
-        output = self.transformer(input_dict, alignment_module=future_alignment_loss, train_mode=True)
+        output = self.transformer(input_dict, alignment_module=motion_incremental_alignment, train_mode=True)
         latent_loss, action_loss, alignment_loss = self.compute_loss(input_dict, output)
         loss = latent_loss + action_loss + alignment_loss
-
-        loss_grad_norm_metrics = None
-        if should_sync:
-            loss_grad_norm_metrics = self._log_loss_grad_norms(latent_loss, action_loss, alignment_loss)
 
         loss.backward()
 
@@ -508,7 +431,6 @@ class Trainer:
                 accumulated_action_losses,
                 accumulated_align_losses,
                 progress_bar,
-                loss_grad_norm_metrics,
             )
             accumulated_latent_losses = []
             accumulated_action_losses = []
