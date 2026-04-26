@@ -4,12 +4,12 @@ set -x
 
 umask 007
  
-NGPU=${NGPU:-"4"}
+NGPU=${NGPU:-"8"}
 MASTER_PORT=${MASTER_PORT:-"29501"}
 PORT=${PORT:-"1106"}
 LOG_RANK=${LOG_RANK:-"0"}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
-CONFIG_NAME=${CONFIG_NAME:-"coef_train"}
+CONFIG_NAME=${CONFIG_NAME:-"unified_train"}
 PYTHON_BIN=${PYTHON_BIN:-"/root/miniconda3/envs/lingbot/bin/python"}
 
 overrides=""
@@ -57,13 +57,13 @@ PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${torchft_
 
 # printf "python -m torch.distributed.run --nproc_per_node=%s --local-ranks-filter=%s --master_port %s --tee 3 -m wan_va.train --config-name %s %s" "$num_gpu" "$log_rank" "$master_port" "$config_name" "$overrides"
 
-export CUDA_VISIBLE_DEVICES=4,5
-python -m wan_va.infer --config-name ${config_name} $overrides
+# export CUDA_VISIBLE_DEVICES=4,5
+# python -m wan_va.infer --config-name ${config_name} $overrides
 
-# "${PYTHON_BIN}" -m torch.distributed.run \
-#     --nproc_per_node=${num_gpu} \
-#     --local-ranks-filter=${log_rank} \
-#     --master_port ${master_port} \
-#     --tee 3 \
-#     -m wan_va.train --config-name ${config_name} $overrides
+"${PYTHON_BIN}" -m torch.distributed.run \
+    --nproc_per_node=${num_gpu} \
+    --local-ranks-filter=${log_rank} \
+    --master_port ${master_port} \
+    --tee 3 \
+    -m wan_va.train --config-name ${config_name} $overrides
 

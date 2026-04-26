@@ -5,7 +5,6 @@ import sys
 from pathlib import Path
 import wandb
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -36,10 +35,9 @@ from modules.utils import (
 )
 
 from modules.alignment import (
-    motion_incremental_alignment,
     future_alignment_loss,
+    motion_incremental_alignment,
     motion_incremental_alignment_tokenwise,
-    UnifiedTraceAlign,
 )
 from utils import (
     init_logger, 
@@ -52,7 +50,7 @@ from utils import (
     collate_get_mask,
     modelswitch
 )
-from dataset import MultiLatentLeRobotDataset
+from dataset import InferMultiLatentLeRobotDataset
 import gc
 # from remote_pdb import RemotePdb
 import torch.multiprocessing as mp
@@ -73,7 +71,7 @@ class Trainer:
                 # dir=log_dir,
                 config=config,
                 mode="online",
-                name = f'{keyword}_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
+                name = f'{keyword}_INFERENCE_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
                 # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
             )
             logger.info("WandB logging enabled")
@@ -83,24 +81,15 @@ class Trainer:
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
         # print(config.max_tokens)
-        
-        ## Trace hyper-parameters
         self.enable_trace = config.enable_trace
         self.trace_coef = getattr(config, 'trace_coef', 0.05)
-        self.unified_loss = getattr(config, 'loss_unified', False)
-        self.future_weight = getattr(config, 'future_weight', 1.0)
-        self.motion_weight = getattr(config, 'motion_weight', 1.0)
         self.K_frames = getattr(config, 'K_frames', 3)
         self.align_layer = getattr(config, 'align_layer', 20)
-        self.future_align_layer = getattr(config, 'future_align_layer', 14)
-        self.motion_align_layer = getattr(config, 'motion_align_layer', 21)
-        
         # Load models
         logger.info("Loading models...")
 
         # Load and shard transformer with FSDP
         logger.info("Loading transformer...")
-        
         
         is_resume = hasattr(config, 'resume_from') and config.resume_from
         if is_resume:
@@ -121,15 +110,10 @@ class Trainer:
             trace_dimension=getattr(config, 'trace_dimension', None),
             target_dim=getattr(config, 'target_dim', None),
         )
-        # if not is_resumed:
         self.transformer._init_trace_parameters(
-            # data_type = torch.float32,
             K_frames = self.K_frames,
-            align_layer = self.align_layer,
-            future_align_layer=self.future_align_layer,
-            motion_align_layer=self.motion_align_layer,
+            align_layer = self.align_layer
         )
-        
         logger.info("Setting up activation checkpointing ...")
         apply_ac(self.transformer)
 
@@ -165,24 +149,24 @@ class Trainer:
 
         # Setup dataloaders
         logger.info("Setting up datasets...")
-        train_dataset = MultiLatentLeRobotDataset(
+        infer_dataset = InferMultiLatentLeRobotDataset(
             config=config,
             num_init_worker=1
         )
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=config.world_size,
-            rank=config.rank,
-            shuffle=True,
-            seed=42
-        ) if config.world_size > 1 else None
+        # train_sampler = DistributedSampler(
+        #     train_dataset,
+        #     num_replicas=config.world_size,
+        #     rank=config.rank,
+        #     shuffle=True,
+        #     seed=42
+        # ) if config.world_size > 1 else None
 
-        self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.batch_size,
-            shuffle=(train_sampler is None), 
-            num_workers=config.load_worker,
-            sampler=train_sampler,
+        self.infer_loader = DataLoader(
+            infer_dataset,
+            batch_size = 1,
+            shuffle = False, 
+            num_workers = config.load_worker,
+            # sampler=train_sampler,
             # collate_fn = collate_get_mask,
         )
 
@@ -316,55 +300,11 @@ class Trainer:
             input_dict[key] = value.to(self.device)#.to(self.dtype)
         return input_dict
 
-    def _scale_alignment_losses(self, alignment_loss, reference_loss):
-        zero = reference_loss.new_zeros(())
-        if not self.enable_trace or alignment_loss is None:
-            return {'total': zero}
-
-        # trace_coef, future_weight and motion_weight are the same meaning, don't repeat to mutiply .
-        scale = 1 / self.gradient_accumulation_steps
-        if isinstance(alignment_loss, (tuple, list)):
-            if len(alignment_loss) != 2:
-                raise ValueError(f"Expected alignment tuple as (future_loss, motion_loss), got {len(alignment_loss)} values")
-
-            future_loss, motion_loss = alignment_loss
-            future_loss = future_loss * self.future_weight * scale
-            motion_loss = motion_loss * self.motion_weight * scale
-            return {
-                'total': future_loss + motion_loss,
-                'future': future_loss,
-                'motion': motion_loss,
-            }
-        else:
-            alignment_loss = alignment_loss * self.trace_coef
-            return {'total': alignment_loss * scale}
-
-    def _append_alignment_losses(self, accumulated_align_losses, alignment_losses):
-        for name, loss in alignment_losses.items():
-            accumulated_align_losses.setdefault(name, []).append(loss.detach())
-
-    def _summarize_alignment_losses(self, accumulated_align_losses):
-        summaries = {}
-        for name, losses in accumulated_align_losses.items():
-            if len(losses) == 0:
-                continue
-
-            stacked_sum = torch.stack(losses).sum()
-            summaries[name] = {
-                'avg': dist_mean(stacked_sum).detach().cpu().item(),
-                'max': dist_max(stacked_sum).detach().cpu().item(),
-            }
-
-        if 'total' not in summaries:
-            summaries['total'] = {'avg': 0, 'max': 0}
-
-        return summaries
-    
     def compute_loss(self,
         input_dict,
         pred
     ):  
-        alignment_loss = None
+        alignment_loss = torch.tensor(0.0)
         if len(pred) == 3:
             latent_pred, action_pred, alignment_loss = pred
         else:
@@ -404,8 +344,7 @@ class Trainer:
         action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
         action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
 
-        alignment_losses = self._scale_alignment_losses(alignment_loss, latent_loss)
-        return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps, alignment_losses
+        return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps, (alignment_loss * self.trace_coef) / self.gradient_accumulation_steps
 
     def _finalize_optimizer_step(
         self,
@@ -428,9 +367,8 @@ class Trainer:
         max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
         max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
 
-        alignment_summaries = self._summarize_alignment_losses(accumulated_align_losses)
-        alignment_loss_show = alignment_summaries['total']['avg']
-        max_alignment_loss_show = alignment_summaries['total']['max']
+        alignment_loss_show = dist_mean(torch.stack(accumulated_align_losses).sum()).detach().cpu().item() if self.enable_trace else 0
+        max_alignment_loss_show = dist_max(torch.stack(accumulated_align_losses).sum()).detach().cpu().item() if self.enable_trace else 0
 
         torch.cuda.synchronize()
         if self.step % self.config.gc_interval == 0:
@@ -439,20 +377,14 @@ class Trainer:
 
         if self.config.rank == 0:
             progress_bar.n += num_accumulated_batches
-            postfix = {
+            progress_bar.set_postfix({
                 'latent_loss': f'{latent_loss_show:.5f}',
                 'action_loss': f'{action_loss_show:.5f}',
                 'alignment_loss': f'{alignment_loss_show:.5f}',
                 'step': self.step,
                 'grad_norm': f'{total_norm.item():.3f}',
                 'lr': f'{lr:.2e}'
-            }
-            if 'future' in alignment_summaries:
-                postfix['future_align'] = f"{alignment_summaries['future']['avg']:.5f}"
-            if 'motion' in alignment_summaries:
-                postfix['motion_align'] = f"{alignment_summaries['motion']['avg']:.5f}"
-            progress_bar.set_postfix(postfix)
-
+            })
             if self.config.enable_wandb:
                 wandb_metrics = {
                     'loss_metrics/global_avg_video_loss': latent_loss_show,
@@ -464,11 +396,6 @@ class Trainer:
                     'grad_norm': total_norm.item(),
                     'lr': lr,
                 }
-                for name, summary in alignment_summaries.items():
-                    if name == 'total':
-                        continue
-                    wandb_metrics[f'loss_metrics/global_avg_alignment_{name}_loss'] = summary['avg']
-                    wandb_metrics[f'loss_metrics/global_max_alignment_{name}_loss'] = summary['max']
                 self.wandb.log(wandb_metrics, step=self.step)
 
         self.step += 1
@@ -487,26 +414,21 @@ class Trainer:
         progress_bar,
         is_last_valid_batch=False,
     ):
-        should_sync = (
-            (valid_batch_count + 1) % self.gradient_accumulation_steps == 0
-            or is_last_valid_batch
-        )
-        self.transformer.set_requires_gradient_sync(should_sync)
+        # should_sync = (
+        #     (valid_batch_count + 1) % self.gradient_accumulation_steps == 0
+        #     or is_last_valid_batch
+        # )
+        # self.transformer.set_requires_gradient_sync(should_sync)
 
-        align_modules = {
-            'dynamic': motion_incremental_alignment_tokenwise,
-            'future': future_alignment_loss,
-        }
-        output = self.transformer(input_dict, alignment_modules = align_modules, train_mode = True)
-        latent_loss, action_loss, alignment_losses = self.compute_loss(input_dict, output)
-        
-        loss = latent_loss + action_loss + alignment_losses['total']
+        output = self.transformer(input_dict, alignment_module=motion_incremental_alignment_tokenwise, train_mode=True)
+        latent_loss, action_loss, alignment_loss = self.compute_loss(input_dict, output)
+        loss = latent_loss + action_loss + alignment_loss
 
         loss.backward()
 
         accumulated_latent_losses.append(latent_loss.detach())
         accumulated_action_losses.append(action_loss.detach())
-        self._append_alignment_losses(accumulated_align_losses, alignment_losses)
+        accumulated_align_losses.append(alignment_loss.detach() if self.enable_trace else 0)
 
         if should_sync:
             self._finalize_optimizer_step(
@@ -517,7 +439,7 @@ class Trainer:
             )
             accumulated_latent_losses = []
             accumulated_action_losses = []
-            accumulated_align_losses = {}
+            accumulated_align_losses = []
 
         return (
             valid_batch_count + 1,
@@ -526,67 +448,53 @@ class Trainer:
             accumulated_align_losses,
         )
 
-    def train_epoch(self):
-        self.transformer.train()
+    @torch.no_grad
+    def infer_epoch(self):
+        self.transformer.eval()
 
         # Use manual progress bar control to only update on optimizer steps
         progress_bar = tqdm(
-            total=len(self.train_loader),
-            desc="Training",
+            total=len(self.infer_loader),
+            desc="Inference",
             disable=(self.config.rank != 0),
             leave=True, 
             dynamic_ncols=True
         )
 
-        self.optimizer.zero_grad(set_to_none=True)
-        accumulated_latent_losses = []
-        accumulated_action_losses = []
-        accumulated_align_losses = {}
+        # self.optimizer.zero_grad(set_to_none=True)
+        latent_losses = {}
+        action_losses = {}
+        align_losses = {}
         valid_batch_count = 0
         pending_input_dict = None
-        for batch in self.train_loader:
+        for (batch, task) in self.infer_loader:
+            task = task[0]
             batch = self.convert_input_format(batch)
 
             input_dict = self._prepare_input_dict(batch, self.config)
             if isinstance(input_dict,bool) and not input_dict:
                 continue
+            
+            output = self.transformer(input_dict, alignment_module=future_alignment_loss, train_mode=True)
+            latent_loss, action_loss, alignment_loss = self.compute_loss(input_dict, output)
+            
+            if task not in latent_losses:
+                latent_losses[task] = []
+                action_losses[task] = []
+                align_losses[task] = []
 
-            if pending_input_dict is not None:
-                (
-                    valid_batch_count,
-                    accumulated_latent_losses,
-                    accumulated_action_losses,
-                    accumulated_align_losses,
-                ) = self._run_train_micro_step(
-                    pending_input_dict,
-                    valid_batch_count,
-                    accumulated_latent_losses,
-                    accumulated_action_losses,
-                    accumulated_align_losses,
-                    progress_bar,
-                    is_last_valid_batch=False,
-                )
-
-            pending_input_dict = input_dict
-
-        if pending_input_dict is not None:
-            (
-                valid_batch_count,
-                accumulated_latent_losses,
-                accumulated_action_losses,
-                accumulated_align_losses,
-            ) = self._run_train_micro_step(
-                pending_input_dict,
-                valid_batch_count,
-                accumulated_latent_losses,
-                accumulated_action_losses,
-                accumulated_align_losses,
-                progress_bar,
-                is_last_valid_batch=True,
-            )
-
-        progress_bar.close()
-
+            latent_losses[task].append(latent_loss.item())
+            action_losses[task].append(action_loss.item())
+            align_losses[task].append(alignment_loss.item())
+            # print(task, latent_loss, action_loss, alignment_loss)
+        res = {
+            'latent_loss': latent_losses,
+            'action_losses': action_losses,
+            'align_losses': align_losses,
+        }
+        with open('va_inference_loss.json','w') as f:
+            json.dump(res,f)
+        
     def save_checkpoint(self,):
         """Save model checkpoint in the same format as pretrained model."""
         try:
@@ -678,14 +586,14 @@ class Trainer:
         if dist.is_initialized():
             dist.barrier()
 
-    def train(self):
+    def infer(self):
         """Main training loop."""
         logger.info(f"Starting training for {self.config.num_steps} steps...")
 
-        while self.step < self.config.num_steps:
-            self.train_epoch()
-            if dist.is_initialized():
-                dist.barrier()
+        # while self.step < self.config.num_steps:
+        self.infer_epoch()
+        # if dist.is_initialized():
+        #         dist.barrier()
 
         logger.info("Training completed!")
 
@@ -719,7 +627,7 @@ def run(args):
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
     # pdb.set_trace()
     trainer = Trainer(config)
-    trainer.train()
+    trainer.infer()
 
 
 def main():

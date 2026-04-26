@@ -42,7 +42,6 @@ from .heads import PixelHead, ScalarHead
 
 from contextlib import contextmanager
 import time
-import pdb
 
 
 # ======== B-spline  ========
@@ -282,7 +281,6 @@ class TraceAnything(nn.Module):
             feats_chunks, pos_chunks = [], []
             for s in range(0, imgs.shape[0], chunk_size):
                 e = min(s + chunk_size, imgs.shape[0])
-                pdb.set_trace()
                 f, p = self.encoder(imgs[s:e], true_shapes[s:e])
                 feats_chunks.append(f); pos_chunks.append(p)
             feats = torch.cat(feats_chunks, dim=0); pos = torch.cat(pos_chunks, dim=0)

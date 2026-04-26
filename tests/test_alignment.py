@@ -69,3 +69,48 @@ def test_motion_incremental_alignment_raises_for_unknown_pool():
 
     with pytest.raises(ValueError, match="Unknown pool type"):
         alignment.motion_incremental_alignment(x, x.clone(), Tokens=3, pool="sum")
+
+
+def test_unified_trace_align_returns_components_for_multiple_batches():
+    batch_size = 2
+    frames = 4
+    tokens = 3
+    hidden_dim = 2
+
+    base_tokens = torch.tensor(
+        [[[1.0, 2.0], [2.0, 1.0], [1.0, -1.0]]], dtype=torch.float32
+    )
+    scales = torch.arange(1, frames + 1, dtype=torch.float32).view(1, frames, 1, 1)
+    x = (scales * base_tokens[:, None]).repeat(batch_size, 1, 1, 1)
+    x = x.reshape(batch_size, frames * tokens, hidden_dim)
+
+    future_loss, motion_loss = alignment.UnifiedTraceAlign(
+        x,
+        x.clone(),
+        Tokens=tokens,
+    )
+
+    assert future_loss.shape == torch.Size([])
+    assert motion_loss.shape == torch.Size([])
+    assert torch.isfinite(future_loss)
+    assert torch.isfinite(motion_loss)
+    assert future_loss.item() <= 1e-6
+    assert motion_loss.item() <= 1e-6
+
+
+def test_unified_trace_align_handles_one_frame():
+    x = torch.randn(2, 3, 4)
+
+    future_loss, motion_loss = alignment.UnifiedTraceAlign(x, x.clone(), Tokens=3)
+
+    assert future_loss.shape == torch.Size([])
+    assert motion_loss.shape == torch.Size([])
+    assert future_loss.item() == 0.0
+    assert motion_loss.item() == 0.0
+
+
+def test_unified_trace_align_raises_for_invalid_sequence_length():
+    x = torch.randn(1, 5, 4)
+
+    with pytest.raises(ValueError, match="not divisible by Tokens"):
+        alignment.UnifiedTraceAlign(x, x.clone(), Tokens=2)

@@ -19,7 +19,7 @@ va_robotwin_train_cfg.save_interval = 500
 va_robotwin_train_cfg.gc_interval = 50
 va_robotwin_train_cfg.cfg_prob = 0.1
 va_robotwin_train_cfg.wan22_pretrained_model_name_or_path = os.path.join(va_robotwin_train_cfg.cache_path, 'modelscope/hub/models/robbyant/lingbot-va-base/')
-# va_robotwin_train_cfg.resume_from = os.path.join('/data/lingbot/ckpt/ta_4_16_50000/checkpoints/checkpoint_step_2000/')
+va_robotwin_train_cfg.resume_from = os.path.join('/data/lingbot/motion_align_token/ta_4_16_50000/checkpoints/checkpoint_step_1000/')
 
 # Training parameters
 va_robotwin_train_cfg.learning_rate = 1e-5
@@ -29,12 +29,12 @@ va_robotwin_train_cfg.weight_decay = 0.1
 va_robotwin_train_cfg.warmup_steps = 10
 va_robotwin_train_cfg.batch_size = 1
 va_robotwin_train_cfg.gradient_accumulation_steps = 16
-va_robotwin_train_cfg.num_steps = 50000
-va_robotwin_train_cfg.keyword = 'motion_align'
-va_robotwin_train_cfg.save_root = f'/data/lingbot/{va_robotwin_train_cfg.keyword}/ta_{int(64/va_robotwin_train_cfg.gradient_accumulation_steps)}_{va_robotwin_train_cfg.gradient_accumulation_steps}_50000'
+va_robotwin_train_cfg.num_steps = 1500
+va_robotwin_train_cfg.keyword = 'motion_align_token'
+va_robotwin_train_cfg.save_root = f'/data/lingbot/{va_robotwin_train_cfg.keyword}/resume_{int(64/va_robotwin_train_cfg.gradient_accumulation_steps)}_{va_robotwin_train_cfg.gradient_accumulation_steps}_{va_robotwin_train_cfg.num_steps}'
 # others
 va_robotwin_train_cfg.max_tokens = 512
 va_robotwin_train_cfg.enable_trace = True
 va_robotwin_train_cfg.trace_coef = 0.02
 va_robotwin_train_cfg.K_frames = 1
-va_robotwin_train_cfg.align_layer = 20
+va_robotwin_train_cfg.align_layer = 22

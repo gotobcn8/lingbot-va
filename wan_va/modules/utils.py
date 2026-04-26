@@ -42,11 +42,28 @@ def load_transformer(
     transformer_path,
     torch_dtype,
     torch_device,
+    enable_trace=False,
+    is_resume=False,
+    trace_dimension=None,
+    target_dim=None,
+    **kwargs,
 ):
+    if enable_trace and is_resume:
+        kwargs["enable_trace"] = True
+        if trace_dimension is not None:
+            kwargs["trace_dimension"] = trace_dimension
+        if target_dim is not None:
+            kwargs["target_dim"] = target_dim
+
     model = WanTransformer3DModel.from_pretrained(
         transformer_path,
         torch_dtype=torch_dtype,
+        **kwargs,
     )
+    if enable_trace and not is_resume:
+        model.init_trace_modules(trace_dimension=trace_dimension,
+                                 target_dim=target_dim,
+                                 dtype=torch_dtype)
     return model.to(torch_device)
 
 

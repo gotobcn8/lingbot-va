@@ -20,6 +20,8 @@ from .step2.ta_train_coef import va_robotwin_train_cfg as coef_train
 from .step2.ta_train_motion import va_robotwin_train_cfg as motion_train
 from .step2.ta_infer_motion import va_robotwin_train_cfg as motion_infer
 
+from .unified.ta_train_unified import va_robotwin_train_cfg as unified_train
+
 VA_CONFIGS = {
     'robotwin': va_robotwin_cfg,
     'franka': va_franka_cfg,
@@ -41,4 +43,5 @@ VA_CONFIGS = {
     'coef_train':coef_train,
     'motion_train':motion_train,
     'motion_infer':motion_infer,
+    'unified_train':unified_train,
 }
