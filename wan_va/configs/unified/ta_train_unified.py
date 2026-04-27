@@ -19,7 +19,7 @@ va_robotwin_train_cfg.save_interval = 500
 va_robotwin_train_cfg.gc_interval = 50
 va_robotwin_train_cfg.cfg_prob = 0.1
 va_robotwin_train_cfg.wan22_pretrained_model_name_or_path = os.path.join(va_robotwin_train_cfg.cache_path, 'modelscope/hub/models/robbyant/lingbot-va-base/')
-# va_robotwin_train_cfg.resume_from = os.path.join('/data/lingbot/motion_align_token/ta_4_16_50000/checkpoints/checkpoint_step_1000/')
+# va_robotwin_train_cfg.resume_from = os.path.join('/data/lingbot/unified_layer_switch/resume_8_8_2500/checkpoints/checkpoint_step_500/')
 
 # Training parameters
 va_robotwin_train_cfg.learning_rate = 1e-5
@@ -30,11 +30,10 @@ va_robotwin_train_cfg.warmup_steps = 10
 va_robotwin_train_cfg.batch_size = 1
 va_robotwin_train_cfg.gradient_accumulation_steps = 8
 va_robotwin_train_cfg.num_steps = 2500
-va_robotwin_train_cfg.keyword = 'unified_layer_switch'
+va_robotwin_train_cfg.keyword = 'unified_manifold'
 va_robotwin_train_cfg.save_root = f'/data/lingbot/{va_robotwin_train_cfg.keyword}/resume_{int(64/va_robotwin_train_cfg.gradient_accumulation_steps)}_{va_robotwin_train_cfg.gradient_accumulation_steps}_{va_robotwin_train_cfg.num_steps}'
 # others
 va_robotwin_train_cfg.max_tokens = 512
-
 
 # Trace alignment
 va_robotwin_train_cfg.enable_trace = True
@@ -45,3 +44,6 @@ va_robotwin_train_cfg.align_layer = 22
 va_robotwin_train_cfg.future_weight = 0.02
 va_robotwin_train_cfg.motion_weight = 0.02
 va_robotwin_train_cfg.loss_unified = True
+va_robotwin_train_cfg.motion_grad_gate_enabled = True
+va_robotwin_train_cfg.motion_grad_gate_threshold = 0.0
+va_robotwin_train_cfg.motion_grad_gate_conflict_scale = 0.0

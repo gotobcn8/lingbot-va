@@ -1108,6 +1108,209 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             return latent_hidden_states, action_hidden_states, (loss_future, loss_motion)
 
         return latent_hidden_states, action_hidden_states
+
+    def forward_train_manifold(
+        self,
+        input_dict,
+        alignment_modules=None,
+        motion_conflict_scale=0.0,
+        conflict_threshold=0.0,
+        return_manifold_stats=False,
+    ):
+        input_dict['latent_dict']['noisy_latents'] = input_dict['latent_dict']['noisy_latents'].to(torch.bfloat16)
+        input_dict['latent_dict']['latent'] = input_dict['latent_dict']['latent'].to(torch.bfloat16)
+        input_dict['action_dict']['noisy_latents'] = input_dict['action_dict']['noisy_latents'].to(torch.bfloat16)
+        input_dict['action_dict']['latent'] = input_dict['action_dict']['latent'].to(torch.bfloat16)
+
+        latent_dict = input_dict['latent_dict']
+        action_dict = input_dict['action_dict']
+        batch_size = latent_dict['noisy_latents'].shape[0]
+
+        latent_hidden_states = self._input_embed(latent_dict['noisy_latents'], input_type='latent').flatten(0, 1)[None]
+        action_hidden_states = self._input_embed(action_dict['noisy_latents'], input_type='action').flatten(0, 1)[None]
+        text_hidden_states = self._input_embed(latent_dict["text_emb"], input_type='text')
+        text_hidden_states = text_hidden_states.flatten(0, 1)[None]
+
+        condition_latent_hidden_states = self._input_embed(latent_dict['latent'], input_type='latent').flatten(0, 1)[None]
+        condition_action_hidden_states = self._input_embed(action_dict['latent'], input_type='action').flatten(0, 1)[None]
+
+        if 'trace' in input_dict:
+            input_dict['trace'] = input_dict['trace'].to(torch.bfloat16)
+            raw_trace_hidden_states, tokens = self.downsample_trace(input_dict['trace'], latent_dict['noisy_latents'].shape[2])
+            future_trace_hidden_states = self.future_trace_proj(raw_trace_hidden_states)
+            motion_trace_hidden_states = self.motion_trace_proj(raw_trace_hidden_states)
+            loss_future = None
+            loss_motion = None
+
+        hidden_states = torch.cat([
+            latent_hidden_states,
+            condition_latent_hidden_states,
+            action_hidden_states,
+            condition_action_hidden_states,
+        ], dim=1)
+
+        latent_grid_id = latent_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
+        action_grid_id = action_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
+        full_grid_id = torch.cat([latent_grid_id] * 2 + [action_grid_id] * 2, dim=2)
+        rotary_emb = self.rope(full_grid_id)[:, :, None]
+
+        latent_time_steps = torch.cat(
+            [latent_dict['timesteps'].flatten(0, 1), latent_dict['cond_timesteps'].flatten(0, 1)]
+        )[None]
+        action_time_steps = torch.cat(
+            [action_dict['timesteps'].flatten(0, 1), action_dict['cond_timesteps'].flatten(0, 1)]
+        )[None]
+        latent_temb, latent_timestep_proj = self._time_embed(
+            latent_time_steps,
+            latent_dict['noisy_latents'].shape[-2],
+            latent_dict['noisy_latents'].shape[-1],
+            dtype=hidden_states.dtype,
+            action_mode=False,
+        )
+        action_temb, action_timestep_proj = self._time_embed(
+            action_time_steps,
+            action_dict['noisy_latents'].shape[-2],
+            action_dict['noisy_latents'].shape[-1],
+            dtype=hidden_states.dtype,
+            action_mode=True,
+        )
+        temb = torch.cat([latent_temb, action_temb], dim=1)
+        timestep_proj = torch.cat([latent_timestep_proj, action_timestep_proj], dim=1)
+
+        text_active_length = input_dict.get('text_active_length', MAX_TEXT_LEN)
+        total_length = hidden_states.shape[1]
+        padded_length = (128 - total_length % 128) % 128
+        hidden_states = F.pad(hidden_states, (0, 0, 0, padded_length))
+        rotary_emb = F.pad(rotary_emb, (0, 0, 0, 0, 0, padded_length))
+        temb = F.pad(temb, (0, 0, 0, padded_length))
+        timestep_proj = F.pad(timestep_proj, (0, 0, 0, 0, 0, padded_length))
+
+        split_list = [
+            latent_hidden_states.shape[1],
+            condition_latent_hidden_states.shape[1],
+            action_hidden_states.shape[1],
+            condition_action_hidden_states.shape[1],
+            padded_length,
+        ]
+
+        FlexAttnFunc.init_mask(
+            latent_dict['noisy_latents'].shape,
+            action_dict['noisy_latents'].shape,
+            padded_length,
+            text_active_length,
+            input_dict["chunk_size"],
+            window_size=input_dict['window_size'],
+            patch_size=self.patch_size,
+            device=hidden_states.device,
+        )
+
+        common_align_layer = min(self.future_align_layer, self.motion_align_layer)
+        manifold_hidden_states = None
+        align_hidden_states_future = None
+        align_hidden_states_motion = None
+        for layer, block in enumerate(self.blocks):
+            torch.cuda.synchronize()
+            hidden_states = block(
+                hidden_states,
+                text_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                update_cache=False,
+            )
+            torch.cuda.synchronize()
+
+            if layer == common_align_layer:
+                manifold_hidden_states = hidden_states
+
+            if layer == self.future_align_layer:
+                align_hidden_states_future, _, _, _, _ = torch.split(hidden_states, split_list, dim=1)
+                align_hidden_states_future = rearrange(
+                    align_hidden_states_future,
+                    '1 (b l) c -> b l c',
+                    b=batch_size,
+                )
+                loss_future = self.aligner(
+                    align_hidden_states_future,
+                    future_trace_hidden_states,
+                    tokens,
+                    alignment_modules,
+                    align_key='future',
+                )
+
+            if layer == self.motion_align_layer:
+                align_hidden_states_motion, _, _, _, _ = torch.split(hidden_states, split_list, dim=1)
+                align_hidden_states_motion = rearrange(
+                    align_hidden_states_motion,
+                    '1 (b l) c -> b l c',
+                    b=batch_size,
+                )
+                loss_motion = self.aligner(
+                    align_hidden_states_motion,
+                    motion_trace_hidden_states,
+                    tokens,
+                    alignment_modules,
+                    align_key='dynamic',
+                )
+
+        temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
+        shift, scale = rearrange(temb_scale_shift_table, 'b l n c -> b n l c').chunk(2, dim=1)
+        shift = shift.to(hidden_states.device).squeeze(1)
+        scale = scale.to(hidden_states.device).squeeze(1)
+        hidden_states = (self.norm_out(hidden_states.float()) * (1. + scale) + shift).type_as(hidden_states)
+        latent_hidden_states, _, action_hidden_states, _, _ = torch.split(hidden_states, split_list, dim=1)
+        latent_hidden_states = self.proj_out(latent_hidden_states)
+        latent_hidden_states = rearrange(
+            latent_hidden_states,
+            '1 (b l) (n c) -> b (l n) c',
+            n=math.prod(self.patch_size),
+            b=batch_size,
+        )
+        action_hidden_states = self.action_proj_out(action_hidden_states)
+        action_hidden_states = rearrange(action_hidden_states, '1 (b l) c -> b l c', b=batch_size)
+
+        if 'trace' not in input_dict:
+            return latent_hidden_states, action_hidden_states
+
+        if loss_future is None or loss_motion is None or manifold_hidden_states is None:
+            raise ValueError(
+                "Trace alignment layers were not reached. "
+                f"future_align_layer={self.future_align_layer}, "
+                f"motion_align_layer={self.motion_align_layer}, "
+                f"common_align_layer={common_align_layer}, "
+                f"num_layers={self.num_layers}"
+            )
+
+        future_grad = torch.autograd.grad(
+            loss_future,
+            align_hidden_states_future,
+            retain_graph=True,
+            allow_unused=False,
+        )[0]
+        motion_grad = torch.autograd.grad(
+            loss_motion,
+            align_hidden_states_motion,
+            retain_graph=True,
+            allow_unused=False,
+        )[0]
+        future_grad = future_grad.detach().float().flatten()
+        motion_grad = motion_grad.detach().float().flatten()
+        future_motion_cosine = F.cosine_similarity(future_grad, motion_grad, dim=0)
+        motion_scale = torch.where(
+            future_motion_cosine < conflict_threshold,
+            future_motion_cosine.new_tensor(motion_conflict_scale),
+            future_motion_cosine.new_tensor(1.0),
+        )
+        gated_loss_motion = loss_motion * motion_scale.detach()
+
+        if return_manifold_stats:
+            stats = {
+                'common_align_layer': int(common_align_layer),
+                'future_motion_cosine': future_motion_cosine.detach(),
+                'motion_scale': motion_scale.detach(),
+            }
+            return latent_hidden_states, action_hidden_states, (loss_future, gated_loss_motion, stats)
+
+        return latent_hidden_states, action_hidden_states, (loss_future, gated_loss_motion)
     
     def aligner(self, align_hidden_states, trace_hidden_states, tokens, align_modules, align_key = 'dynamic'):
         if align_modules is None or align_key not in align_modules:
@@ -1309,7 +1512,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
         if train_mode:
-            return self.forward_train(input_dict, alignment_modules or alignment_module)
+            return self.forward_train_manifold(input_dict, alignment_modules or alignment_module)
         if action_mode:  # action input emb
             latent_hidden_states = rearrange(input_dict['noisy_latents'], 'b c f h w -> b (f h w) c')
             latent_hidden_states = self.action_embedder(
