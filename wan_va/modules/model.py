@@ -659,6 +659,31 @@ class WanTransformerBlock(nn.Module):
         return hidden_states
 
 
+import torch
+import torch.nn as nn
+
+class FuturePredictor(nn.Module):
+    def __init__(self, dim, hidden_dim=None):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = dim * 2
+        
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim),
+        )
+        
+        # initialized to be as minimum value，make model tends to outcome p projection. protect main task keep indistort
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x):
+        # x: (B, Tokens, D)
+        # residual structure：predict "change frrom future compared with current."
+        return x + self.net(x)
+
 class WanTransformer3DModel(ModelMixin, ConfigMixin):
     r"""
     TODO
@@ -1106,16 +1131,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                     f"num_layers={self.num_layers}"
                 )
             return latent_hidden_states, action_hidden_states, (loss_future, loss_motion)
-
+        
         return latent_hidden_states, action_hidden_states
 
     def forward_train_manifold(
         self,
         input_dict,
         alignment_modules=None,
-        motion_conflict_scale=0.0,
-        conflict_threshold=0.0,
-        return_manifold_stats=False,
     ):
         input_dict['latent_dict']['noisy_latents'] = input_dict['latent_dict']['noisy_latents'].to(torch.bfloat16)
         input_dict['latent_dict']['latent'] = input_dict['latent_dict']['latent'].to(torch.bfloat16)
@@ -1204,8 +1226,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             device=hidden_states.device,
         )
 
-        common_align_layer = min(self.future_align_layer, self.motion_align_layer)
-        manifold_hidden_states = None
         align_hidden_states_future = None
         align_hidden_states_motion = None
         for layer, block in enumerate(self.blocks):
@@ -1218,9 +1238,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 update_cache=False,
             )
             torch.cuda.synchronize()
-
-            if layer == common_align_layer:
-                manifold_hidden_states = hidden_states
 
             if layer == self.future_align_layer:
                 align_hidden_states_future, _, _, _, _ = torch.split(hidden_states, split_list, dim=1)
@@ -1271,46 +1288,15 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         if 'trace' not in input_dict:
             return latent_hidden_states, action_hidden_states
 
-        if loss_future is None or loss_motion is None or manifold_hidden_states is None:
+        if loss_future is None or loss_motion is None:
             raise ValueError(
                 "Trace alignment layers were not reached. "
                 f"future_align_layer={self.future_align_layer}, "
                 f"motion_align_layer={self.motion_align_layer}, "
-                f"common_align_layer={common_align_layer}, "
                 f"num_layers={self.num_layers}"
             )
 
-        future_grad = torch.autograd.grad(
-            loss_future,
-            align_hidden_states_future,
-            retain_graph=True,
-            allow_unused=False,
-        )[0]
-        motion_grad = torch.autograd.grad(
-            loss_motion,
-            align_hidden_states_motion,
-            retain_graph=True,
-            allow_unused=False,
-        )[0]
-        future_grad = future_grad.detach().float().flatten()
-        motion_grad = motion_grad.detach().float().flatten()
-        future_motion_cosine = F.cosine_similarity(future_grad, motion_grad, dim=0)
-        motion_scale = torch.where(
-            future_motion_cosine < conflict_threshold,
-            future_motion_cosine.new_tensor(motion_conflict_scale),
-            future_motion_cosine.new_tensor(1.0),
-        )
-        gated_loss_motion = loss_motion * motion_scale.detach()
-
-        if return_manifold_stats:
-            stats = {
-                'common_align_layer': int(common_align_layer),
-                'future_motion_cosine': future_motion_cosine.detach(),
-                'motion_scale': motion_scale.detach(),
-            }
-            return latent_hidden_states, action_hidden_states, (loss_future, gated_loss_motion, stats)
-
-        return latent_hidden_states, action_hidden_states, (loss_future, gated_loss_motion)
+        return latent_hidden_states, action_hidden_states, (loss_future, loss_motion)
     
     def aligner(self, align_hidden_states, trace_hidden_states, tokens, align_modules, align_key = 'dynamic'):
         if align_modules is None or align_key not in align_modules:
@@ -1322,6 +1308,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             align_loss = align_modules[align_key](
                 align_hidden_states,
                 trace_hidden_states,
+                K=self.K_frames,
                 Tokens=tokens,
             )
         

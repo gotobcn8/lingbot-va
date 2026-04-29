@@ -184,7 +184,7 @@ def motion_incremental_alignment(
 
     return loss
 
-def motion_incremental_alignment_tokenwise(a, b, Tokens=192, eps=1e-8, **_):
+def motion_incremental_alignment_tokenwise(a, b, K = 3, Tokens=192, eps=1e-8, **_):
     """
     Token-wise motion incremental alignment.
 
@@ -208,8 +208,8 @@ def motion_incremental_alignment_tokenwise(a, b, Tokens=192, eps=1e-8, **_):
     b = b.view(B, F_steps, Tokens, D)
 
     # temporal delta per token
-    delta_a = a[:, 1:] - a[:, :-1]   # (B, F-1, Tokens, D)
-    delta_b = b[:, 1:] - b[:, :-1]
+    delta_a = a[:, K:] - a[:, :-K]   # (B, F-1, Tokens, D)
+    delta_b = b[:, K:] - b[:, :-K]
 
     if delta_a.shape[1] == 0:
         return torch.zeros((), device=a.device, dtype=a.dtype)

@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import math
 import os
 import sys
 from pathlib import Path
@@ -90,9 +91,29 @@ class Trainer:
         self.unified_loss = getattr(config, 'loss_unified', False)
         self.future_weight = getattr(config, 'future_weight', 1.0)
         self.motion_weight = getattr(config, 'motion_weight', 1.0)
-        self.motion_grad_gate_enabled = getattr(config, 'motion_grad_gate_enabled', True)
-        self.motion_grad_gate_threshold = getattr(config, 'motion_grad_gate_threshold', 0.0)
-        self.motion_grad_gate_conflict_scale = getattr(config, 'motion_grad_gate_conflict_scale', 0.0)
+        self.motion_gating_enabled = getattr(
+            config,
+            'motion_gating_enabled',
+            getattr(config, 'motion_grad_gate_enabled', True),
+        )
+        self.motion_gating_beta = getattr(
+            config,
+            'motion_gating_beta',
+            getattr(config, 'motion_spike_beta', 1.0),
+        )
+        self.motion_gating_tau = getattr(
+            config,
+            'motion_gating_tau',
+            getattr(config, 'motion_spike_tau', 1.0),
+        )
+        self.motion_gating_warmup_steps = getattr(
+            config,
+            'motion_gating_warmup_steps',
+            getattr(config, 'motion_warmup_steps', getattr(config, 'warmup_steps', 1)),
+        )
+        self.latent_ema_decay = getattr(config, 'latent_ema_decay', 0.99)
+        self.latent_ema = None
+        self._pending_motion_gate_stats = None
         self.K_frames = getattr(config, 'K_frames', 3)
         self.align_layer = getattr(config, 'align_layer', 20)
         self.future_align_layer = getattr(config, 'future_align_layer', 14)
@@ -202,7 +223,7 @@ class Trainer:
         self.save_dir = Path(config.save_root) / "checkpoints"
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.layer_grad_norm_log_path = Path(config.save_root) / "dit_layer_grad_norms.jsonl"
-        self.motion_grad_gate_log_path = Path(config.save_root) / "motion_grad_gate.jsonl"
+        self.motion_gating_log_path = Path(config.save_root) / "motion_gating.jsonl"
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         # if hasattr(config, 'resume_from') and config.resume_from:
@@ -326,7 +347,7 @@ class Trainer:
             input_dict[key] = value.to(self.device)#.to(self.dtype)
         return input_dict
 
-    def _scale_alignment_losses(self, alignment_loss, reference_loss, motion_weight_scale=1.0):
+    def _scale_alignment_losses(self, alignment_loss, reference_loss, motion_scale=1.0):
         zero = reference_loss.new_zeros(())
         if not self.enable_trace or alignment_loss is None:
             return {'total': zero}
@@ -339,7 +360,7 @@ class Trainer:
 
             future_loss, motion_loss = alignment_loss
             future_loss = future_loss * self.future_weight * scale
-            motion_loss = motion_loss * self.motion_weight * motion_weight_scale * scale
+            motion_loss = motion_loss * motion_scale * scale
             return {
                 'total': future_loss + motion_loss,
                 'future': future_loss,
@@ -353,129 +374,46 @@ class Trainer:
         for name, loss in alignment_losses.items():
             accumulated_align_losses.setdefault(name, []).append(loss.detach())
 
-    def _motion_gate_params(self):
-        last_common_layer = self.motion_align_layer
-        params = []
-        for layer, block in enumerate(self.transformer.blocks):
-            if layer > last_common_layer:
-                break
-            params.extend(param for param in block.parameters() if param.requires_grad)
-        return params, last_common_layer
+    def _compute_motion_gating_scale(self, latent_loss):
+        if not self.motion_gating_enabled or not self.enable_trace:
+            return self.motion_weight, None
 
-    def _save_trainable_grads(self):
-        return [param.grad for param in self.trainable_params]
-
-    def _restore_trainable_grads(self, saved_grads):
-        for param, saved_grad in zip(self.trainable_params, saved_grads):
-            param.grad = saved_grad
-
-    def _clear_trainable_grads(self):
-        for param in self.trainable_params:
-            param.grad = None
-
-    def _collect_batched_grads_for_motion_gate(self, input_dict, align_modules, params):
-        output = self.transformer(input_dict, alignment_modules=align_modules, train_mode=True)
-        latent_loss, _, alignment_losses = self.compute_loss(input_dict, output)
-        motion_loss = alignment_losses.get('motion')
-        if (
-            motion_loss is None
-            or not latent_loss.requires_grad
-            or not motion_loss.requires_grad
-        ):
-            empty_grads = [None] * len(params)
-            return empty_grads, empty_grads
-
-        grad_outputs = (
-            latent_loss.new_tensor([1.0, 0.0]),
-            motion_loss.new_tensor([0.0, 1.0]),
-        )
-        batched_grads = torch.autograd.grad(
-            outputs=(latent_loss, motion_loss),
-            inputs=params,
-            grad_outputs=grad_outputs,
-            retain_graph=False,
-            create_graph=False,
-            allow_unused=True,
-            is_grads_batched=True,
-        )
-
-        latent_grads = []
-        motion_grads = []
-        for grad in batched_grads:
-            if grad is None:
-                latent_grads.append(None)
-                motion_grads.append(None)
-                continue
-            if hasattr(grad, "to_local"):
-                grad = grad.to_local()
-            grad = grad.detach().float()
-            latent_grads.append(grad[0].clone())
-            motion_grads.append(grad[1].clone())
-        return latent_grads, motion_grads
-
-    def _compute_motion_grad_gate(self, input_dict, align_modules, should_sync):
-        if not self.motion_grad_gate_enabled or not self.enable_trace:
-            return 1.0, None
-
-        common_params, last_common_layer = self._motion_gate_params()
-        if not common_params:
-            return 1.0, None
-
-        saved_grads = self._save_trainable_grads()
-        try:
-            self.transformer.set_requires_gradient_sync(False)
-            latent_grads, motion_grads = self._collect_batched_grads_for_motion_gate(
-                input_dict,
-                align_modules,
-                common_params,
-            )
-        finally:
-            self._restore_trainable_grads(saved_grads)
-            self.transformer.set_requires_gradient_sync(should_sync)
-
-        dot = torch.zeros((), device=self.device, dtype=torch.float32)
-        latent_norm_sq = torch.zeros((), device=self.device, dtype=torch.float32)
-        motion_norm_sq = torch.zeros((), device=self.device, dtype=torch.float32)
-        grad_param_count = torch.zeros((), device=self.device, dtype=torch.float32)
-        for latent_grad, motion_grad in zip(latent_grads, motion_grads):
-            if latent_grad is None or motion_grad is None:
-                continue
-            dot = dot + (latent_grad * motion_grad).sum()
-            latent_norm_sq = latent_norm_sq + latent_grad.pow(2).sum()
-            motion_norm_sq = motion_norm_sq + motion_grad.pow(2).sum()
-            grad_param_count += 1
-
+        latent_loss_for_gate = latent_loss.detach().float()
         if dist.is_initialized():
-            dist.all_reduce(dot, op=dist.ReduceOp.SUM)
-            dist.all_reduce(latent_norm_sq, op=dist.ReduceOp.SUM)
-            dist.all_reduce(motion_norm_sq, op=dist.ReduceOp.SUM)
-            dist.all_reduce(grad_param_count, op=dist.ReduceOp.MAX)
+            latent_loss_for_gate = dist_mean(latent_loss_for_gate)
 
-        latent_norm = latent_norm_sq.sqrt()
-        motion_norm = motion_norm_sq.sqrt()
-        cosine = dot / (latent_norm * motion_norm + 1e-12)
-        cosine_value = cosine.detach().cpu().item()
-        motion_weight_scale = (
-            self.motion_grad_gate_conflict_scale
-            if cosine_value < self.motion_grad_gate_threshold
-            else 1.0
+        if self.latent_ema is None:
+            self.latent_ema = latent_loss_for_gate.clone()
+
+        warmup_steps = max(1, int(self.motion_gating_warmup_steps))
+        motion_warmup = min(float(self.step) / float(warmup_steps), 1.0)
+        spike_ratio = latent_loss_for_gate / (self.latent_ema + 1e-8)
+        spike_scale = math.exp(
+            -float(self.motion_gating_beta)
+            * max(0.0, spike_ratio.detach().cpu().item() - float(self.motion_gating_tau))
+        )
+        motion_scale = self.motion_weight * motion_warmup * spike_scale
+
+        self.latent_ema = (
+            self.latent_ema * float(self.latent_ema_decay)
+            + latent_loss_for_gate * (1.0 - float(self.latent_ema_decay))
         )
         stats = {
             'step': self.step,
-            'valid_common_until_layer': int(last_common_layer),
-            'latent_motion_cosine': cosine_value,
-            'latent_motion_dot': dot.detach().cpu().item(),
-            'latent_grad_norm': latent_norm.detach().cpu().item(),
-            'motion_grad_norm': motion_norm.detach().cpu().item(),
-            'grad_param_count': int(grad_param_count.detach().cpu().item()),
-            'motion_weight_scale': motion_weight_scale,
+            'latent_loss': latent_loss_for_gate.detach().cpu().item(),
+            'latent_ema': self.latent_ema.detach().cpu().item(),
+            'spike_ratio': spike_ratio.detach().cpu().item(),
+            'spike_scale': spike_scale,
+            'motion_warmup': motion_warmup,
+            'base_motion_weight': self.motion_weight,
+            'motion_scale': motion_scale,
         }
-        return motion_weight_scale, stats
+        return motion_scale, stats
 
-    def _log_motion_grad_gate(self, stats):
+    def _log_motion_gating(self, stats):
         if stats is None or self.config.rank != 0:
             return
-        with self.motion_grad_gate_log_path.open('a', encoding='utf-8') as f:
+        with self.motion_gating_log_path.open('a', encoding='utf-8') as f:
             f.write(json.dumps(stats) + '\n')
 
     def _collect_dit_layer_grad_norms(self):
@@ -569,7 +507,6 @@ class Trainer:
     def compute_loss(self,
         input_dict,
         pred,
-        motion_weight_scale=1.0,
     ):  
         alignment_loss = None
         if len(pred) == 3:
@@ -611,10 +548,13 @@ class Trainer:
         action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
         action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
 
+        motion_scale, motion_gate_stats = self._compute_motion_gating_scale(latent_loss)
+        self._pending_motion_gate_stats = motion_gate_stats
+
         alignment_losses = self._scale_alignment_losses(
             alignment_loss,
             latent_loss,
-            motion_weight_scale=motion_weight_scale,
+            motion_scale=motion_scale,
         )
         return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps, alignment_losses
 
@@ -719,19 +659,9 @@ class Trainer:
             'dynamic': motion_incremental_alignment_tokenwise,
             'future': future_alignment_loss,
         }
-        motion_weight_scale, motion_gate_stats = self._compute_motion_grad_gate(
-            input_dict,
-            align_modules,
-            should_sync,
-        )
-        self._log_motion_grad_gate(motion_gate_stats)
-
         output = self.transformer(input_dict, alignment_modules = align_modules, train_mode = True)
-        latent_loss, action_loss, alignment_losses = self.compute_loss(
-            input_dict,
-            output,
-            motion_weight_scale=motion_weight_scale,
-        )
+        latent_loss, action_loss, alignment_losses = self.compute_loss(input_dict, output)
+        self._log_motion_gating(self._pending_motion_gate_stats)
         
         loss = latent_loss + action_loss + alignment_losses['total']
 
@@ -972,10 +902,12 @@ def run(args):
         config.save_root = args.save_root
     if args.disable_motion_grad_gate:
         config.motion_grad_gate_enabled = False
-    if args.motion_grad_gate_threshold is not None:
-        config.motion_grad_gate_threshold = args.motion_grad_gate_threshold
-    if args.motion_grad_gate_conflict_scale is not None:
-        config.motion_grad_gate_conflict_scale = args.motion_grad_gate_conflict_scale
+    if args.motion_gating_beta is not None:
+        config.motion_gating_beta = args.motion_gating_beta
+    if args.motion_gating_tau is not None:
+        config.motion_gating_tau = args.motion_gating_tau
+    if args.motion_gating_warmup_steps is not None:
+        config.motion_gating_warmup_steps = args.motion_gating_warmup_steps
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
@@ -1003,19 +935,37 @@ def main():
     parser.add_argument(
         "--disable-motion-grad-gate",
         action="store_true",
-        help="Disable the experimental latent/motion gradient gate in this entrypoint.",
+        help="Disable motion gating.",
+    )
+    parser.add_argument(
+        "--motion-gating-beta",
+        type=float,
+        default=None,
+        help="Beta for exp(-beta * max(0, spike_ratio - tau)).",
+    )
+    parser.add_argument(
+        "--motion-gating-tau",
+        type=float,
+        default=None,
+        help="Tau threshold for latent-loss spike gating.",
+    )
+    parser.add_argument(
+        "--motion-gating-warmup-steps",
+        type=int,
+        default=None,
+        help="Warmup steps for motion gating scale.",
     )
     parser.add_argument(
         "--motion-grad-gate-threshold",
         type=float,
         default=None,
-        help="Gate motion loss when cos(g_latent, g_motion) is below this threshold.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--motion-grad-gate-conflict-scale",
         type=float,
         default=None,
-        help="Scale applied to motion loss when the gate detects conflict.",
+        help=argparse.SUPPRESS,
     )
 
     args = parser.parse_args()
