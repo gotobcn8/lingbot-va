@@ -92,7 +92,7 @@ class Trainer:
         self.motion_weight = getattr(config, 'motion_weight', 1.0)
         self.K_frames = getattr(config, 'K_frames', 3)
         self.align_layer = getattr(config, 'align_layer', 20)
-        self.future_align_layer = getattr(config, 'future_align_layer', 21)
+        self.future_align_layer = getattr(config, 'future_align_layer', 22)
         self.motion_align_layer = getattr(config, 'motion_align_layer', 16)
         
         # Load models
@@ -278,14 +278,12 @@ class Trainer:
         )
 
         # batch_dict['text_embed_real'] = batch_dict['text_emb']
-        B, T, D = batch_dict['text_emb'].shape
+        _, T, D = batch_dict['text_emb'].shape
         if T < config.max_tokens:
             batch_dict['text_emb'] = F.pad(
                 batch_dict['text_emb'],
                 (0, 0, 0, config.max_tokens - T),  # (D_left, D_right, T_left, T_right)
             )
-        if B == 1:
-            batch_dict['text_active_length'] = T
         if batch_dict['text_emb'].dtype != torch.bfloat16:
             batch_dict['text_emb'] = batch_dict['text_emb'].to(torch.bfloat16)
         if D != 4096:
@@ -308,7 +306,6 @@ class Trainer:
             'action_dict': action_dict,
             'chunk_size': torch.randint(1, 5, (1,)).item(),
             'window_size': torch.randint(4, 65, (1,)).item(),
-            'text_active_length': batch_dict['text_active_length'],
         }
 
         if 'trace' in batch_dict:

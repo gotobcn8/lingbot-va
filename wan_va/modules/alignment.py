@@ -25,14 +25,12 @@ def create_future_alignment_mask(F, K, device='cuda'):
 
 def future_alignment_loss(a, b, K=3, Tokens=192, temperature=1.0, mask_type='window', eps=1e-8):
     """
-    Future frame alignment
+    Future frame prediction alignment.
     
     Args:
-        a: (B, Fa, T, D) - source repr
-        b: (B, Fb, T, D) - target repr ()
-        K: aligned future frames
-        temperature: temperature coef
-        mask_type: 'triangular' (low triangle) or 'window' (slide window)
+        a: (B, F*Tokens, D) - predicted future representation from model-side MLP
+        b: (B, F*Tokens, D) - target trace representation
+        K: future offset, aligning a[t] with b[t + K]
         
     Returns:
         loss: scalar loss
@@ -51,42 +49,17 @@ def future_alignment_loss(a, b, K=3, Tokens=192, temperature=1.0, mask_type='win
     a = a.reshape(B, Fa, Tokens, D)
     b = b.reshape(B, Fb, Tokens, D)
 
-    a_norm = F.normalize(a, dim=-1, eps=eps)
-    b_norm = F.normalize(b, dim=-1, eps=eps)
-    cos_sim = torch.einsum('bftd,bgtd->bftg', a_norm, b_norm)
-    
-    # 3. 创建对齐 mask
-    if mask_type == 'triangular':
-        # a[t] 对齐 b[t+1:] (需要 Fa == Fb)
-        if Fa != Fb:
-            raise ValueError(f"Triangular mask requires Fa == Fb, but got Fa={Fa}, Fb={Fb}")
-        frame_mask = torch.triu(torch.ones(Fa, Fb, dtype=torch.bool), diagonal=1)
-        
-    elif mask_type == 'window':
-        # a[t] 对齐 b[t+1:t+K+1] (支持 Fa != Fb)
-        frame_mask = torch.zeros(Fa, Fb, dtype=torch.bool)
-        for i in range(Fa):
-            for j in range(i + 1, min(i + K + 1, Fb)):
-                frame_mask[i, j] = True
-    else:
-        raise ValueError(f"Unknown mask_type: {mask_type}")
-    
-    frame_mask = frame_mask.to(a.device)  # (Fa, Fb)
-    
-    token_mask = frame_mask[None, :, None, :].expand(B, Fa, Tokens, Fb)
-    valid_sims = cos_sim[token_mask]
-    
-    if valid_sims.numel() == 0:
+    valid_steps = min(Fa, Fb - K)
+    if valid_steps <= 0:
         return torch.zeros((), device=a.device, dtype=a.dtype)
-    
-    # 5. 计算损失
-    loss = 1 - valid_sims.mean()
-    
-    # 可选: 使用 temperature 缩放
-    if temperature != 1.0:
-        loss = 1 - (valid_sims / temperature).mean()
-    
-    # print(f"frame_mask has {frame_mask.sum().item()} True entries")
+
+    pred = a[:, :valid_steps]
+    target = b[:, K:K + valid_steps]
+
+    mse_loss = F.mse_loss(pred.float(), target.float())
+    cos_sim = F.cosine_similarity(pred.float(), target.float(), dim=-1, eps=eps)
+    loss = mse_loss + 0.1 * (1.0 - cos_sim.mean())
+
     return loss
 
 def future_alignment_loss_excludeself(a, b, K=3, Tokens=192, temperature=1.0, mask_type='window'):
@@ -184,7 +157,7 @@ def motion_incremental_alignment(
 
     return loss
 
-def motion_incremental_alignment_tokenwise(a, b, K = 3, Tokens=192, eps=1e-8, **_):
+def motion_incremental_alignment_tokenwise(a, b, K = 1, Tokens=192, eps=1e-8, **_):
     """
     Token-wise motion incremental alignment.
 
@@ -214,11 +187,7 @@ def motion_incremental_alignment_tokenwise(a, b, K = 3, Tokens=192, eps=1e-8, **
     if delta_a.shape[1] == 0:
         return torch.zeros((), device=a.device, dtype=a.dtype)
 
-    delta_a = F.normalize(delta_a, dim=-1, eps=eps)
-    delta_b = F.normalize(delta_b, dim=-1, eps=eps)
-
-    cos_sim = (delta_a * delta_b).sum(dim=-1)   # (B, F-1, Tokens)
-    loss = 1.0 - cos_sim.mean()
+    loss = F.mse_loss(delta_a.float(), delta_b.float())
 
     return loss
 

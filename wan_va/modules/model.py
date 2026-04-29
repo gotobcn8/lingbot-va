@@ -93,84 +93,12 @@ class FlexAttnFunc(nn.Module):
         x_out = rearrange(x_out, "b n s d -> b s n d")
         return x_out
 
-    # @staticmethod
-    # @torch.no_grad()
-    # def init_mask(
-    #     latent_shape, 
-    #     action_shape, 
-    #     padded_length, 
-    #     text_active_length,
-    #     chunk_size,
-    #     window_size,
-    #     patch_size,
-    #     device,
-    # ):
-    #     B, _, L_F, L_H, L_W = latent_shape
-    #     _, _, A_F, A_H, A_W = action_shape
-
-    #     latent_seq_id = torch.arange(B)[:, None, None, None].\
-    #         expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2]).flatten()
-    #     action_seq_id = torch.arange(B)[:, None, None, None].expand(-1, A_F, A_H, A_W).flatten()
-    #     seq_ids = torch.cat([latent_seq_id] * 2 + [action_seq_id] * 2)
-
-    #     latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
-    #     action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
-    #     frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
-
-    #     noise_ids = torch.cat(
-    #         [
-    #             torch.zeros_like(latent_frame_id),
-    #             torch.ones_like(latent_frame_id),
-    #             torch.zeros_like(action_frame_id),
-    #             torch.ones_like(action_frame_id),
-    #         ]
-    #     )
-
-    #     seq_ids = F.pad(seq_ids, (0, padded_length), value=-1)
-    #     frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
-    #     noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
-
-    #     mask_mod = FlexAttnFunc._get_mask_mod(seq_ids.long().to(device), frame_ids.long().to(device), noise_ids.long().to(device), window_size)
-    #     block_mask = FlexAttnFunc.compiled_create_block_mask(
-    #             mask_mod, 1, 1, len(seq_ids), len(seq_ids), device=device, _compile=True
-    #         )
-    #     FlexAttnFunc.attention_mask = block_mask
-
-    #     if not torch.is_tensor(text_active_length):
-    #         if isinstance(text_active_length, (list, tuple)):
-    #             text_active_length = torch.tensor(text_active_length)
-    #         else:
-    #             text_active_length = torch.full((B,), int(text_active_length))
-    #     else:
-    #         text_active_length = text_active_length.to(device)
-
-    #     if text_active_length.ndim == 0:
-    #         text_active_length = text_active_length.repeat(B)
-
-    #     text_active_length = text_active_length.clamp(min=0, max=MAX_TEXT_LEN)
-
-    #     # init text_seq_ids
-    #     text_seq_ids = torch.full((B, MAX_TEXT_LEN), -1)
-
-    #     for i in range(B):
-    #         valid_len = int(text_active_length[i].item())
-    #         text_seq_ids[i, :valid_len] = i
-
-    #     text_seq_ids = text_seq_ids.flatten()
-    #     # text_seq_ids = text_seq_ids.flatten()
-    #     # text_seq_ids = torch.arange(B)[:, None].expand(-1, 128).flatten()
-    #     mask_mod_cross = FlexAttnFunc._get_cross_mask_mod(seq_ids.long().to(device), text_seq_ids.long().to(device))
-    #     block_mask_cross = FlexAttnFunc.compiled_create_block_mask(
-    #             mask_mod_cross, 1, 1, len(seq_ids), len(text_seq_ids), device=device, _compile=True
-    #         )
-    #     FlexAttnFunc.cross_attention_mask = block_mask_cross
     @staticmethod
     @torch.no_grad()
     def init_mask(
         latent_shape, 
         action_shape, 
         padded_length, 
-        text_active_length,
         chunk_size,
         window_size,
         patch_size,
@@ -658,31 +586,41 @@ class WanTransformerBlock(nn.Module):
                          ff_output.float() * c_gate_msa).type_as(hidden_states)
         return hidden_states
 
-
-import torch
-import torch.nn as nn
-
-class FuturePredictor(nn.Module):
-    def __init__(self, dim, hidden_dim=None):
+class HiddenMLP(nn.Module):
+    def __init__(self, dim, target_dim = None, hidden_dim=None):
         super().__init__()
+        target_dim = target_dim or dim
+        self.use_residual = target_dim == dim
         if hidden_dim is None:
-            hidden_dim = dim * 2
-        
+            hidden_dim = target_dim if dim == 3072 else dim * 2
+
         self.net = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, dim),
+            nn.Linear(hidden_dim, target_dim),
         )
-        
-        # initialized to be as minimum value，make model tends to outcome p projection. protect main task keep indistort
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
+        self.net.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            nn.init.kaiming_normal_(
+                module.weight,
+                a=0,
+                mode='fan_out',
+                nonlinearity='relu',
+            )
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
     def forward(self, x):
         # x: (B, Tokens, D)
         # residual structure：predict "change frrom future compared with current."
-        return x + self.net(x)
+        pred = self.net(x)
+        if self.use_residual:
+            pred = x + pred
+        return pred
 
 class WanTransformer3DModel(ModelMixin, ConfigMixin):
     r"""
@@ -730,7 +668,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         pos_embed_seq_len=None,
         attn_mode="torch",
         trace_dimension = 4096,
-        target_dim = 2048,
+        target_dim = 4096,
         enable_trace = False,
     ):
         r"""
@@ -794,68 +732,62 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         trace_dimension = trace_dimension or self.trace_dimension
         target_dim = target_dim or self.target_dim
 
-        has_required_modules = (
-            hasattr(self, "motion_trace_proj")
-            and hasattr(self, "future_trace_proj")
-            and hasattr(self, "motion_align_proj")
-            and hasattr(self, "future_align_proj")
-        )
-        if has_required_modules:
-            current_trace_dimension = self.motion_trace_proj[0].in_features
-            current_target_dim = self.motion_trace_proj[-1].out_features
-            if (current_trace_dimension == trace_dimension
-                    and current_target_dim == target_dim):
-                self.register_to_config(enable_trace=True,
-                                        trace_dimension=trace_dimension,
-                                        target_dim=target_dim)
-                return
-
         reference_param = next(self.parameters(), None)
         if reference_param is not None:
             device = device or reference_param.device
             dtype = dtype or reference_param.dtype
 
+        if hasattr(self, "future_hidden_mlp") and hasattr(self, "motion_hidden_mlp"):
+            self.future_hidden_mlp = HiddenMLP(self.inner_dim, trace_dimension)
+            self.motion_hidden_mlp = HiddenMLP(self.inner_dim, trace_dimension)
+            if device is not None or dtype is not None:
+                self.future_hidden_mlp.to(device=device, dtype=dtype)
+                self.motion_hidden_mlp.to(device=device, dtype=dtype)
+            self.register_to_config(enable_trace=True,
+                                    trace_dimension=trace_dimension,
+                                    target_dim=target_dim)
+            return
+
         self.trace_dimension = trace_dimension
         self.target_dim = target_dim
 
-        def build_trace_proj():
-            return nn.Sequential(
-                nn.Linear(self.trace_dimension, self.inner_dim),
-                nn.GELU(),
-                nn.Linear(self.inner_dim, target_dim),
-            )
+        # def build_trace_proj():
+        #     return nn.Sequential(
+        #         nn.Linear(self.trace_dimension, self.inner_dim),
+        #         nn.GELU(),
+        #         nn.Linear(self.inner_dim, target_dim),
+        #     )
 
         # self.trace_proj = build_trace_proj()
-        self.motion_trace_proj = build_trace_proj()
-        self.future_trace_proj = build_trace_proj()
-        self.motion_align_proj = nn.Sequential(
-            nn.Linear(self.inner_dim, target_dim),
-            nn.GELU(),
-            nn.Linear(target_dim, target_dim),
-        )
+        # self.motion_trace_proj = build_trace_proj()
+        # self.future_trace_proj = build_trace_proj()
+        # self.motion_align_proj = nn.Sequential(
+        #     nn.Linear(self.inner_dim, target_dim),
+        #     nn.GELU(),
+        #     nn.Linear(target_dim, target_dim),
+        # )
         # self.future_hidden_mlp = nn.Linear(
         #     trace_dim,
         #     self.inner_dim,
         #     # dtype=data_type,
         # )
-        self.future_align_proj = nn.Sequential(
-            nn.Linear(self.inner_dim, target_dim),
-            nn.GELU(),
-            nn.Linear(target_dim, target_dim),
-        )
+        # self.future_align_proj = nn.Sequential(
+        #     nn.Linear(self.inner_dim, target_dim),
+        #     nn.GELU(),
+        #     nn.Linear(target_dim, target_dim),
+        # )
+        # self.trace_simple_proj = nn.Linear(self.trace_dimension,target_dim)
+        self.future_hidden_mlp = HiddenMLP(self.inner_dim, trace_dimension)
+        self.motion_hidden_mlp = HiddenMLP(self.inner_dim, trace_dimension)
         if device is not None or dtype is not None:
-            # self.trace_proj.to(device=device, dtype=dtype)
-            self.motion_trace_proj.to(device=device, dtype=dtype)
-            self.future_trace_proj.to(device=device, dtype=dtype)
-            self.motion_align_proj.to(device=device, dtype=dtype)
-            self.future_align_proj.to(device=device, dtype=dtype)
-            
+            self.future_hidden_mlp.to(device=device, dtype=dtype)
+            self.motion_hidden_mlp.to(device=device, dtype=dtype)
+
         self.register_to_config(enable_trace=True,
                                 trace_dimension=trace_dimension,
                                 target_dim=target_dim)
 
-        
-        
+
     def _init_trace_parameters(self, 
             # trace_dim = 4096, 
             # target_dim = 2048, 
@@ -992,8 +924,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         if 'trace' in input_dict:
             input_dict['trace'] = input_dict['trace'].to(torch.bfloat16)
             raw_trace_hidden_states, tokens = self.downsample_trace(input_dict['trace'], latent_dict['noisy_latents'].shape[2])
-            future_trace_hidden_states = self.future_trace_proj(raw_trace_hidden_states)
-            motion_trace_hidden_states = self.motion_trace_proj(raw_trace_hidden_states)
+            future_trace_hidden_states = raw_trace_hidden_states
+            motion_trace_hidden_states = raw_trace_hidden_states
             loss_future = None
             loss_motion = None
             
@@ -1028,7 +960,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         temb = torch.cat([latent_temb, action_temb], dim=1)
         timestep_proj = torch.cat([latent_timestep_proj, action_timestep_proj], dim=1)
 
-        text_active_length = input_dict.get('text_active_length', MAX_TEXT_LEN)
         total_length = hidden_states.shape[1]
         padded_length = (128 - total_length % 128) % 128
         hidden_states = F.pad(hidden_states, (0, 0, 0, padded_length))
@@ -1052,7 +983,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
                                action_dict['noisy_latents'].shape, 
                                padded_length, 
-                               text_active_length,
                                input_dict["chunk_size"],
                                window_size=input_dict['window_size'],
                                patch_size=self.patch_size,
@@ -1159,8 +1089,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         if 'trace' in input_dict:
             input_dict['trace'] = input_dict['trace'].to(torch.bfloat16)
             raw_trace_hidden_states, tokens = self.downsample_trace(input_dict['trace'], latent_dict['noisy_latents'].shape[2])
-            future_trace_hidden_states = self.future_trace_proj(raw_trace_hidden_states)
-            motion_trace_hidden_states = self.motion_trace_proj(raw_trace_hidden_states)
+            future_trace_hidden_states = raw_trace_hidden_states
+            motion_trace_hidden_states = raw_trace_hidden_states
             loss_future = None
             loss_motion = None
 
@@ -1199,7 +1129,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         temb = torch.cat([latent_temb, action_temb], dim=1)
         timestep_proj = torch.cat([latent_timestep_proj, action_timestep_proj], dim=1)
 
-        text_active_length = input_dict.get('text_active_length', MAX_TEXT_LEN)
         total_length = hidden_states.shape[1]
         padded_length = (128 - total_length % 128) % 128
         hidden_states = F.pad(hidden_states, (0, 0, 0, padded_length))
@@ -1219,7 +1148,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             latent_dict['noisy_latents'].shape,
             action_dict['noisy_latents'].shape,
             padded_length,
-            text_active_length,
             input_dict["chunk_size"],
             window_size=input_dict['window_size'],
             patch_size=self.patch_size,
@@ -1248,7 +1176,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 )
                 loss_future = self.aligner(
                     align_hidden_states_future,
-                    future_trace_hidden_states,
+                    future_trace_hidden_states.detach(),
                     tokens,
                     alignment_modules,
                     align_key='future',
@@ -1263,7 +1191,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 )
                 loss_motion = self.aligner(
                     align_hidden_states_motion,
-                    motion_trace_hidden_states,
+                    motion_trace_hidden_states.detach(),
                     tokens,
                     alignment_modules,
                     align_key='dynamic',
@@ -1304,7 +1232,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
         # dynamic loss
         if align_key == 'dynamic':
-            align_hidden_states = self.motion_align_proj(align_hidden_states)
+            align_hidden_states = self.motion_hidden_mlp(align_hidden_states)
             align_loss = align_modules[align_key](
                 align_hidden_states,
                 trace_hidden_states,
@@ -1313,7 +1241,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             )
         
         elif align_key == 'future':
-            align_hidden_states = self.future_align_proj(align_hidden_states)
+            align_hidden_states = self.future_hidden_mlp(align_hidden_states)
             align_loss = align_modules[align_key](
                 align_hidden_states,
                 trace_hidden_states,
@@ -1385,7 +1313,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         temb = torch.cat([latent_temb, action_temb], dim=1)
         timestep_proj = torch.cat([latent_timestep_proj, action_timestep_proj], dim=1)
 
-        text_active_length = input_dict.get('text_active_length', MAX_TEXT_LEN)
         total_length = hidden_states.shape[1]
         padded_length = (128 - total_length % 128) % 128
         hidden_states = F.pad(hidden_states, (0, 0, 0, padded_length))
@@ -1409,7 +1336,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
                                action_dict['noisy_latents'].shape, 
                                padded_length, 
-                               text_active_length,
                                input_dict["chunk_size"],
                                window_size=input_dict['window_size'],
                                patch_size=self.patch_size,
@@ -1454,15 +1380,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         # cos_sim = F.cosine_similarity(align_hidden_states, h_new, dim=-1) / temperature
         # loss = 1 - cos_sim.mean()
         if 'trace' in input_dict:
-            if (not hasattr(self, "motion_trace_proj")
-                    or not hasattr(self, "motion_align_proj")):
+            if not hasattr(self, "motion_hidden_mlp"):
                 raise ValueError(
                     "Trace input was provided, but trace modules are not initialized. "
                     "Load the transformer with enable_trace=True or resume from a "
                     "checkpoint whose transformer/config.json has enable_trace=true."
                 )
-            align_hidden_states = self.motion_align_proj(align_hidden_states)
-            trace_hidden_states = self.motion_trace_proj(trace_hidden_states)
+            align_hidden_states = self.motion_hidden_mlp(align_hidden_states)
             # trace_loss = alignment_module(align_hidden_states, trace_hidden_states, K = self.K_frames, Tokens = tokens)
             trace_loss = alignment_module(align_hidden_states, trace_hidden_states, K = self.K_frames, Tokens = tokens)
             return latent_hidden_states, action_hidden_states, trace_loss

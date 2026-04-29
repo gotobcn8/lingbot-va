@@ -30,19 +30,19 @@ va_robotwin_train_cfg.warmup_steps = 10
 va_robotwin_train_cfg.batch_size = 1
 va_robotwin_train_cfg.gradient_accumulation_steps = 8
 va_robotwin_train_cfg.num_steps = 2500
-va_robotwin_train_cfg.keyword = 'unified_manifold'
-va_robotwin_train_cfg.save_root = f'/data/lingbot/{va_robotwin_train_cfg.keyword}/resume_{int(64/va_robotwin_train_cfg.gradient_accumulation_steps)}_{va_robotwin_train_cfg.gradient_accumulation_steps}_{va_robotwin_train_cfg.num_steps}'
+va_robotwin_train_cfg.keyword = 'unfiedpro'
+va_robotwin_train_cfg.save_root = f'/data/lingbot/{va_robotwin_train_cfg.keyword}/train_{int(64/va_robotwin_train_cfg.gradient_accumulation_steps)}_{va_robotwin_train_cfg.gradient_accumulation_steps}_{va_robotwin_train_cfg.num_steps}'
 # others
 va_robotwin_train_cfg.max_tokens = 512
 
 # Trace alignment
 va_robotwin_train_cfg.enable_trace = True
 va_robotwin_train_cfg.trace_coef = 0.02
-va_robotwin_train_cfg.K_frames = 3
+va_robotwin_train_cfg.K_frames = 2
 va_robotwin_train_cfg.align_layer = 22
 
-va_robotwin_train_cfg.future_weight = 0.02
-va_robotwin_train_cfg.motion_weight = 0.02
+va_robotwin_train_cfg.future_weight = 0.05
+va_robotwin_train_cfg.motion_weight = 0.05
 va_robotwin_train_cfg.loss_unified = True
 va_robotwin_train_cfg.motion_grad_gate_enabled = True
 va_robotwin_train_cfg.motion_grad_gate_threshold = 0.0
