@@ -21,6 +21,7 @@ from .step2.ta_train_motion import va_robotwin_train_cfg as motion_train
 from .step2.ta_infer_motion import va_robotwin_train_cfg as motion_infer
 
 from .unified.ta_train_unified import va_robotwin_train_cfg as unified_train
+from .attn.ta_train_attn import va_robotwin_train_cfg as attn_train
 
 VA_CONFIGS = {
     'robotwin': va_robotwin_cfg,
@@ -44,4 +45,5 @@ VA_CONFIGS = {
     'motion_train':motion_train,
     'motion_infer':motion_infer,
     'unified_train':unified_train,
+    'attn_train':attn_train,
 }

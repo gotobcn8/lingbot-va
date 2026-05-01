@@ -35,12 +35,6 @@ from modules.utils import (
     load_transformer,
 )
 
-from modules.alignment import (
-    motion_incremental_alignment,
-    future_alignment_loss,
-    motion_incremental_alignment_tokenwise,
-    UnifiedTraceAlign,
-)
 from utils import (
     init_logger, 
     logger, 
@@ -84,12 +78,10 @@ class Trainer:
         self.patch_size = config.patch_size
         # print(config.max_tokens)
         
-        ## Trace hyper-parameters
+        ## Attention guidance hyper-parameters
         self.enable_trace = config.enable_trace
         self.trace_coef = getattr(config, 'trace_coef', 0.05)
-        self.unified_loss = getattr(config, 'loss_unified', False)
-        self.future_weight = getattr(config, 'future_weight', 1.0)
-        self.motion_weight = getattr(config, 'motion_weight', 1.0)
+        self.lambda_attn = getattr(config, 'lambda_attn', getattr(config, 'attn_weight', self.trace_coef))
         self.K_frames = getattr(config, 'K_frames', 3)
         self.align_layer = getattr(config, 'align_layer', 20)
         self.future_align_layer = getattr(config, 'future_align_layer', 22)
@@ -306,6 +298,9 @@ class Trainer:
             'action_dict': action_dict,
             'chunk_size': torch.randint(1, 5, (1,)).item(),
             'window_size': torch.randint(4, 65, (1,)).item(),
+            'attn_align_layer': getattr(self.config, 'attn_align_layer', self.motion_align_layer),
+            'attn_teacher_temperature': getattr(self.config, 'attn_teacher_temperature', 1.0),
+            'attn_teacher_use_delta': getattr(self.config, 'attn_teacher_use_delta', True),
         }
 
         if 'trace' in batch_dict:
@@ -319,32 +314,18 @@ class Trainer:
             input_dict[key] = value.to(self.device)#.to(self.dtype)
         return input_dict
 
-    def _scale_alignment_losses(self, alignment_loss, reference_loss):
+    def _scale_attention_loss(self, attention_loss, reference_loss):
         zero = reference_loss.new_zeros(())
-        if not self.enable_trace or alignment_loss is None:
+        if not self.enable_trace or attention_loss is None:
             return {'total': zero}
 
-        # trace_coef, future_weight and motion_weight are the same meaning, don't repeat to mutiply .
         scale = 1 / self.gradient_accumulation_steps
-        if isinstance(alignment_loss, (tuple, list)):
-            if len(alignment_loss) != 2:
-                raise ValueError(f"Expected alignment tuple as (future_loss, motion_loss), got {len(alignment_loss)} values")
+        attention_loss = attention_loss * self.lambda_attn
+        return {'total': attention_loss * scale, 'attn': attention_loss * scale}
 
-            future_loss, motion_loss = alignment_loss
-            future_loss = future_loss * self.future_weight * scale
-            motion_loss = motion_loss * self.motion_weight * scale
-            return {
-                'total': future_loss + motion_loss,
-                'future': future_loss,
-                'motion': motion_loss,
-            }
-        else:
-            alignment_loss = alignment_loss * self.trace_coef
-            return {'total': alignment_loss * scale}
-
-    def _append_alignment_losses(self, accumulated_align_losses, alignment_losses):
-        for name, loss in alignment_losses.items():
-            accumulated_align_losses.setdefault(name, []).append(loss.detach())
+    def _append_attention_losses(self, accumulated_attention_losses, attention_losses):
+        for name, loss in attention_losses.items():
+            accumulated_attention_losses.setdefault(name, []).append(loss.detach())
 
     def _collect_dit_layer_grad_norms(self):
         grad_norm_sqs = []
@@ -417,9 +398,9 @@ class Trainer:
         with self.layer_grad_norm_log_path.open('a', encoding='utf-8') as f:
             f.write(json.dumps(record) + '\n')
 
-    def _summarize_alignment_losses(self, accumulated_align_losses):
+    def _summarize_attention_losses(self, accumulated_attention_losses):
         summaries = {}
-        for name, losses in accumulated_align_losses.items():
+        for name, losses in accumulated_attention_losses.items():
             if len(losses) == 0:
                 continue
 
@@ -438,12 +419,12 @@ class Trainer:
         input_dict,
         pred
     ):  
-        alignment_loss = None
+        attention_loss = None
         if len(pred) == 3:
-            latent_pred, action_pred, alignment_loss = pred
+            latent_pred, action_pred, attention_loss = pred
         else:
             latent_pred, action_pred = pred
-        # print(alignment_loss)
+        # print(attention_loss)
         action_pred = rearrange(action_pred, 'b (f n) c -> b c f n 1', f=input_dict['action_dict']['targets'].shape[-3])
         latent_pred = data_seq_to_patch(
                         self.patch_size, latent_pred,
@@ -478,14 +459,14 @@ class Trainer:
         action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
         action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
 
-        alignment_losses = self._scale_alignment_losses(alignment_loss, latent_loss)
-        return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps, alignment_losses
+        attention_losses = self._scale_attention_loss(attention_loss, latent_loss)
+        return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps, attention_losses
 
     def _finalize_optimizer_step(
         self,
         accumulated_latent_losses,
         accumulated_action_losses,
-        accumulated_align_losses,
+        accumulated_attention_losses,
         progress_bar,
         # layer_grad_norms,
         # layer_grad_norm_log_reason,
@@ -513,9 +494,9 @@ class Trainer:
         max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
         max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
 
-        alignment_summaries = self._summarize_alignment_losses(accumulated_align_losses)
-        alignment_loss_show = alignment_summaries['total']['avg']
-        max_alignment_loss_show = alignment_summaries['total']['max']
+        attention_summaries = self._summarize_attention_losses(accumulated_attention_losses)
+        attention_loss_show = attention_summaries['total']['avg']
+        max_attention_loss_show = attention_summaries['total']['max']
 
         torch.cuda.synchronize()
         if self.step % self.config.gc_interval == 0:
@@ -527,33 +508,29 @@ class Trainer:
             postfix = {
                 'latent_loss': f'{latent_loss_show:.5f}',
                 'action_loss': f'{action_loss_show:.5f}',
-                'alignment_loss': f'{alignment_loss_show:.5f}',
+                'attention_loss': f'{attention_loss_show:.5f}',
                 'step': self.step,
                 'grad_norm': f'{total_norm.item():.3f}',
                 'lr': f'{lr:.2e}'
             }
-            if 'future' in alignment_summaries:
-                postfix['future_align'] = f"{alignment_summaries['future']['avg']:.5f}"
-            if 'motion' in alignment_summaries:
-                postfix['motion_align'] = f"{alignment_summaries['motion']['avg']:.5f}"
             progress_bar.set_postfix(postfix)
 
             if self.config.enable_wandb:
                 wandb_metrics = {
                     'loss_metrics/global_avg_video_loss': latent_loss_show,
                     'loss_metrics/global_avg_action_loss': action_loss_show,
-                    'loss_metrics/global_avg_alignment_loss': alignment_loss_show,
+                    'loss_metrics/global_avg_attention_loss': attention_loss_show,
                     'loss_metrics/global_max_video_loss': max_latent_loss_show,
                     'loss_metrics/global_max_action_loss': max_action_loss_show,
-                    'loss_metrics/global_max_alignment_loss': max_alignment_loss_show,
+                    'loss_metrics/global_max_attention_loss': max_attention_loss_show,
                     'grad_norm': total_norm.item(),
                     'lr': lr,
                 }
-                for name, summary in alignment_summaries.items():
+                for name, summary in attention_summaries.items():
                     if name == 'total':
                         continue
-                    wandb_metrics[f'loss_metrics/global_avg_alignment_{name}_loss'] = summary['avg']
-                    wandb_metrics[f'loss_metrics/global_max_alignment_{name}_loss'] = summary['max']
+                    wandb_metrics[f'loss_metrics/global_avg_attention_{name}_loss'] = summary['avg']
+                    wandb_metrics[f'loss_metrics/global_max_attention_{name}_loss'] = summary['max']
                 self.wandb.log(wandb_metrics, step=self.step)
 
         self.step += 1
@@ -568,7 +545,7 @@ class Trainer:
         valid_batch_count,
         accumulated_latent_losses,
         accumulated_action_losses,
-        accumulated_align_losses,
+        accumulated_attention_losses,
         progress_bar,
         is_last_valid_batch=False,
     ):
@@ -578,46 +555,22 @@ class Trainer:
         )
         self.transformer.set_requires_gradient_sync(should_sync)
 
-        align_modules = {
-            'dynamic': motion_incremental_alignment_tokenwise,
-            'future': future_alignment_loss,
-        }
-        output = self.transformer(input_dict, alignment_modules = align_modules, train_mode = True)
-        latent_loss, action_loss, alignment_losses = self.compute_loss(input_dict, output)
-        
-        loss = latent_loss + action_loss + alignment_losses['total']
-
-        # layer_grad_norms = []
-        # layer_grad_norm_log_reason = None
-        # layer_grad_norm_log_latent_loss = None
-        # layer_grad_norm_log_valid_batch_count = valid_batch_count
-        # should_log_grad_norms, layer_grad_norm_log_reason, layer_grad_norm_log_latent_loss = (
-        #     self._should_log_layer_grad_norms(latent_loss, allow_periodic_log=should_sync)
-        # )
+        output = self.transformer(input_dict, train_attn_mode=True)
+        latent_loss, action_loss, attention_losses = self.compute_loss(input_dict, output)
+        loss = latent_loss + action_loss + attention_losses['total']
 
         self.transformer.set_requires_gradient_sync(should_sync)
         loss.backward()
 
-        # if should_log_grad_norms:
-        #     layer_grad_norms = self._collect_dit_layer_grad_norms()
-        #     if not should_sync:
-        #         self._log_dit_layer_grad_norms(
-        #             layer_grad_norms,
-        #             layer_grad_norm_log_reason,
-        #             layer_grad_norm_log_latent_loss,
-        #             layer_grad_norm_log_valid_batch_count,
-        #         )
-        #         layer_grad_norms = []
-
         accumulated_latent_losses.append(latent_loss.detach())
         accumulated_action_losses.append(action_loss.detach())
-        self._append_alignment_losses(accumulated_align_losses, alignment_losses)
+        self._append_attention_losses(accumulated_attention_losses, attention_losses)
 
         if should_sync:
             self._finalize_optimizer_step(
                 accumulated_latent_losses,
                 accumulated_action_losses,
-                accumulated_align_losses,
+                accumulated_attention_losses,
                 progress_bar,
                 # layer_grad_norms,
                 # layer_grad_norm_log_reason,
@@ -626,13 +579,13 @@ class Trainer:
             )
             accumulated_latent_losses = []
             accumulated_action_losses = []
-            accumulated_align_losses = {}
+            accumulated_attention_losses = {}
 
         return (
             valid_batch_count + 1,
             accumulated_latent_losses,
             accumulated_action_losses,
-            accumulated_align_losses,
+            accumulated_attention_losses,
         )
 
     def train_epoch(self):
@@ -650,7 +603,7 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         accumulated_latent_losses = []
         accumulated_action_losses = []
-        accumulated_align_losses = {}
+        accumulated_attention_losses = {}
         valid_batch_count = 0
         pending_input_dict = None
         for batch in self.train_loader:
@@ -665,13 +618,13 @@ class Trainer:
                     valid_batch_count,
                     accumulated_latent_losses,
                     accumulated_action_losses,
-                    accumulated_align_losses,
+                    accumulated_attention_losses,
                 ) = self._run_train_micro_step(
                     pending_input_dict,
                     valid_batch_count,
                     accumulated_latent_losses,
                     accumulated_action_losses,
-                    accumulated_align_losses,
+                    accumulated_attention_losses,
                     progress_bar,
                     is_last_valid_batch=False,
                 )
@@ -683,13 +636,13 @@ class Trainer:
                 valid_batch_count,
                 accumulated_latent_losses,
                 accumulated_action_losses,
-                accumulated_align_losses,
+                accumulated_attention_losses,
             ) = self._run_train_micro_step(
                 pending_input_dict,
                 valid_batch_count,
                 accumulated_latent_losses,
                 accumulated_action_losses,
-                accumulated_align_losses,
+                accumulated_attention_losses,
                 progress_bar,
                 is_last_valid_batch=True,
             )

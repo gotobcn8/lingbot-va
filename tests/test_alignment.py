@@ -114,3 +114,36 @@ def test_unified_trace_align_raises_for_invalid_sequence_length():
 
     with pytest.raises(ValueError, match="not divisible by Tokens"):
         alignment.UnifiedTraceAlign(x, x.clone(), Tokens=2)
+
+
+def test_ta_to_attention_teacher_returns_frame_token_scores():
+    ta_feat = torch.zeros(1, 3, 2, 2)
+    ta_feat[:, 1, 0] = torch.tensor([3.0, 4.0])
+    ta_feat[:, 2, 1] = torch.tensor([0.0, 2.0])
+
+    score = alignment.ta_to_attention_teacher(ta_feat)
+
+    assert score.shape == torch.Size([1, 3, 2])
+    assert torch.isfinite(score).all()
+
+
+def test_extract_key_attention_reshapes_flat_key_axis():
+    attn = torch.zeros(1, 2, 3, 6)
+    attn[..., 4] = 1.0
+
+    attn_key = alignment.extract_key_attention(attn, frames=2, tokens=3)
+
+    assert attn_key.shape == torch.Size([1, 2, 3])
+    assert torch.argmax(attn_key.reshape(-1)).item() == 4
+
+
+def test_ta_attention_reward_loss_matches_teacher_distribution():
+    attn = torch.tensor([[[0.1, 0.8, 0.1], [0.2, 0.2, 0.6]]], requires_grad=True)
+    ta_teacher = torch.tensor([[[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]])
+
+    loss = alignment.ta_attention_reward_loss(attn, ta_teacher=ta_teacher)
+
+    assert loss.shape == torch.Size([])
+    assert torch.isclose(loss, torch.tensor(-0.7), atol=1e-6)
+    loss.backward()
+    assert attn.grad is not None

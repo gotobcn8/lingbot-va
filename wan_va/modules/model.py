@@ -438,6 +438,9 @@ class WanAttention(torch.nn.Module):
         rotary_emb,
         update_cache=0,
         cache_name='pos',
+        return_attn_probs=False,
+        attn_slice=None,
+        attn_slice_mask=None,
     ):
         kv_cache = self.attn_caches[
             cache_name] if (self.attn_caches is not None) and (cache_name in self.attn_caches) else None
@@ -473,6 +476,33 @@ class WanAttention(torch.nn.Module):
 
         hidden_states = self.attn_op(query, key, value)
 
+        attn_probs = None
+        if return_attn_probs:
+            if attn_slice is not None:
+                q_start, q_length, k_start, k_length = attn_slice
+                query_for_probs = query[:, q_start:q_start + q_length]
+                key_for_probs = key[:, k_start:k_start + k_length]
+            else:
+                query_for_probs = query
+                key_for_probs = key
+
+            scale = key.shape[-1] ** -0.5
+            attn_scores = torch.einsum(
+                'bqhd,bkhd->bhqk',
+                query_for_probs.float(),
+                key_for_probs.float(),
+            ) * scale
+            if attn_slice_mask is not None:
+                attn_mask = attn_slice_mask.to(device=attn_scores.device, dtype=torch.bool)
+                attn_scores = attn_scores.masked_fill(
+                    ~attn_mask[None, None],
+                    torch.finfo(attn_scores.dtype).min,
+                )
+                empty_rows = ~attn_mask.any(dim=-1)
+                if empty_rows.any():
+                    attn_scores[:, :, empty_rows, :] = 0
+            attn_probs = attn_scores.softmax(dim=-1)
+
         if update_cache == 0:
             if kv_cache is not None and kv_cache['k'] is not None:
                 self.restore_cache(cache_name, slots)
@@ -481,6 +511,8 @@ class WanAttention(torch.nn.Module):
         hidden_states = hidden_states.type_as(query)
         hidden_states = self.to_out[0](hidden_states)
         hidden_states = self.to_out[1](hidden_states)
+        if return_attn_probs:
+            return hidden_states, attn_probs
         return hidden_states
 
 
@@ -541,6 +573,9 @@ class WanTransformerBlock(nn.Module):
         rotary_emb,
         update_cache=0,
         cache_name='pos',
+        return_attn_probs=False,
+        attn_slice=None,
+        attn_slice_mask=None,
     ) -> torch.Tensor:
         temb_scale_shift_table = self.scale_shift_table[None] + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = \
@@ -560,7 +595,13 @@ class WanTransformerBlock(nn.Module):
                                  norm_hidden_states,
                                  rotary_emb,
                                  update_cache=update_cache,
-                                 cache_name=cache_name)
+                                 cache_name=cache_name,
+                                 return_attn_probs=return_attn_probs,
+                                 attn_slice=attn_slice,
+                                 attn_slice_mask=attn_slice_mask)
+        attn_probs = None
+        if return_attn_probs:
+            attn_output, attn_probs = attn_output
         hidden_states = (hidden_states.float() +
                          attn_output * gate_msa).type_as(hidden_states)
 
@@ -584,6 +625,8 @@ class WanTransformerBlock(nn.Module):
 
         hidden_states = (hidden_states.float() +
                          ff_output.float() * c_gate_msa).type_as(hidden_states)
+        if return_attn_probs:
+            return hidden_states, attn_probs
         return hidden_states
 
 class HiddenMLP(nn.Module):
@@ -714,9 +757,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             torch.randn(1, 2, inner_dim) / inner_dim**0.5)
         self.target_dim = target_dim
 
-        if enable_trace:
-            self.init_trace_modules(trace_dimension=trace_dimension,
-                                    target_dim=target_dim)
+        # if enable_trace:
+        #     self.init_trace_modules(trace_dimension=trace_dimension,
+        #                             target_dim=target_dim)
         # else:
             # self.trace_hidden_mlp = nn.Linear(
             #     self.trace_dimension,
@@ -795,6 +838,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             align_layer = 20,
             future_align_layer = 22,
             motion_align_layer = 15,
+            teacher_temperature = 1.0,
+            teacher_use_delta = True,
         ):
         # self.trace_hidden_mlp = nn.Linear(
         #     trace_dim,
@@ -811,6 +856,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         #     nn.GELU(),
         #     nn.Linear(target_dim, target_dim, dtype=data_type,),
         # )
+        self.attn_teacher_temperature = teacher_temperature
+        self.attn_teacher_use_delta = teacher_use_delta
         self.K_frames = K_frames
         self.align_layer = align_layer
         self.future_align_layer = future_align_layer
@@ -899,176 +946,144 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     # future_alignment_loss_excludeself,
     # motion_incremental_alignment_tokenwise
 
-    def forward_train(self, input_dict, alignment_modules = None):
-        input_dict['latent_dict']['noisy_latents'] = input_dict['latent_dict']['noisy_latents'].to(torch.bfloat16)
-        input_dict['latent_dict']['latent'] = input_dict['latent_dict']['latent'].to(torch.bfloat16)
-        input_dict['action_dict']['noisy_latents'] = input_dict['action_dict']['noisy_latents'].to(torch.bfloat16)
-        input_dict['action_dict']['latent'] = input_dict['action_dict']['latent'].to(torch.bfloat16)
+    def _resolve_attention_align_layer(self, input_dict):
+        layer = input_dict.get(
+            'attn_align_layer',
+            getattr(self, 'attn_align_layer', getattr(self, 'motion_align_layer', self.num_layers - 1)),
+        )
+        if isinstance(layer, float) and 0 < layer < 1:
+            layer = int(layer * self.num_layers) - 1
+        layer = int(layer)
+        if layer < 0 or layer >= self.num_layers:
+            raise ValueError(f"attn_align_layer must be in [0, {self.num_layers - 1}], got {layer}")
+        return layer
 
-        latent_dict = input_dict['latent_dict']
-        action_dict = input_dict['action_dict']
-        batch_size = latent_dict['noisy_latents'].shape[0]
+    def _prepare_attention_teacher(self, input_dict, target_frames, device):
+        if 'ta_teacher' in input_dict:
+            ta_teacher = input_dict['ta_teacher'].to(device=device)
+            if ta_teacher.dim() != 3:
+                raise ValueError(f"Expected ta_teacher with shape [B, F, N], got {ta_teacher.shape}")
+            return None, ta_teacher, ta_teacher.shape[1], ta_teacher.shape[2]
 
-        # noisy latents
-        latent_hidden_states = self._input_embed(latent_dict['noisy_latents'], input_type='latent').flatten(0, 1)[None]
-        action_hidden_states = self._input_embed(action_dict['noisy_latents'], input_type='action').flatten(0, 1)[None]
-        text_hidden_states = self._input_embed(latent_dict["text_emb"], input_type='text')
+        trace_key = 'ta_feat' if 'ta_feat' in input_dict else 'trace'
+        if trace_key not in input_dict:
+            raise ValueError("forward_train_attn requires input_dict['trace'], input_dict['ta_feat'], or input_dict['ta_teacher']")
 
-        text_hidden_states = text_hidden_states.flatten(0, 1)[None]
+        ta_feat = input_dict[trace_key].to(device=device, dtype=torch.bfloat16).detach()
+        if ta_feat.dim() == 5:
+            ta_feat, tokens = self.downsample_trace(ta_feat, target_frames)
+            ta_feat = rearrange(ta_feat, 'b (f n) d -> b f n d', f=target_frames, n=tokens)
+        elif ta_feat.dim() == 4:
+            tokens = ta_feat.shape[2]
+        elif ta_feat.dim() == 3:
+            tokens = input_dict.get('ta_tokens', None)
+            if tokens is None:
+                raise ValueError("ta_tokens is required when ta_feat has shape [B, F*N, D]")
+            ta_feat = rearrange(ta_feat, 'b (f n) d -> b f n d', f=target_frames, n=tokens)
+        else:
+            raise ValueError(f"Expected trace/ta_feat with shape [B,F,H,W,C], [B,F,N,D], or [B,F*N,D], got {ta_feat.shape}")
 
-        # conditional latent
-        condition_latent_hidden_states = self._input_embed(latent_dict['latent'], input_type='latent').flatten(0, 1)[None]
-        condition_action_hidden_states = self._input_embed(action_dict['latent'], input_type='action').flatten(0, 1)[None]
-        
-        # trace latents
-        if 'trace' in input_dict:
-            input_dict['trace'] = input_dict['trace'].to(torch.bfloat16)
-            raw_trace_hidden_states, tokens = self.downsample_trace(input_dict['trace'], latent_dict['noisy_latents'].shape[2])
-            future_trace_hidden_states = raw_trace_hidden_states
-            motion_trace_hidden_states = raw_trace_hidden_states
-            loss_future = None
-            loss_motion = None
-            
-        hidden_states = torch.cat([latent_hidden_states, 
-                                   condition_latent_hidden_states,
-                                   action_hidden_states, 
-                                   condition_action_hidden_states], dim=1)
+        return ta_feat, None, ta_feat.shape[1], tokens
 
+    def _latent_temporal_condition_mask(self, frames, chunk_size, window_size, device):
+        frame_chunks = torch.arange(frames, device=device) // chunk_size * 2
+        return (
+            (frame_chunks[None, :] < frame_chunks[:, None])
+            & ((frame_chunks[:, None] - frame_chunks[None, :]).abs() <= window_size)
+        )
 
-        latent_grid_id = latent_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
-        action_grid_id = action_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
-        full_grid_id = torch.cat([latent_grid_id] * 2 + [action_grid_id] * 2, dim=2)
+    def _noisy_to_condition_latent_mask(self, batch_size, frames, tokens, temporal_mask):
+        batch_mask = torch.eye(batch_size, dtype=torch.bool, device=temporal_mask.device)
+        token_mask = torch.ones(tokens, tokens, dtype=torch.bool, device=temporal_mask.device)
+        mask = (
+            batch_mask[:, None, None, :, None, None]
+            & temporal_mask[None, :, None, None, :, None]
+            & token_mask[None, None, :, None, None, :]
+        )
+        return mask.reshape(batch_size * frames * tokens, batch_size * frames * tokens)
 
-        rotary_emb = self.rope(full_grid_id)[:, :, None] 
-
-        latent_time_steps = torch.cat(
-            [latent_dict['timesteps'].flatten(0, 1), latent_dict['cond_timesteps'].flatten(0, 1)]
-        )[None]
-        action_time_steps = torch.cat(
-            [action_dict['timesteps'].flatten(0, 1), action_dict['cond_timesteps'].flatten(0, 1)]
-        )[None]
-        latent_temb, latent_timestep_proj =self._time_embed(latent_time_steps, 
-                        latent_dict['noisy_latents'].shape[-2], 
-                        latent_dict['noisy_latents'].shape[-1], 
-                        dtype=hidden_states.dtype, 
-                        action_mode=False)
-        action_temb, action_timestep_proj = self._time_embed(action_time_steps,
-                        action_dict['noisy_latents'].shape[-2], 
-                        action_dict['noisy_latents'].shape[-1], 
-                        dtype=hidden_states.dtype, 
-                        action_mode=True)
-        temb = torch.cat([latent_temb, action_temb], dim=1)
-        timestep_proj = torch.cat([latent_timestep_proj, action_timestep_proj], dim=1)
-
-        total_length = hidden_states.shape[1]
-        padded_length = (128 - total_length % 128) % 128
-        hidden_states = F.pad(hidden_states, (0, 0, 0, padded_length))
-        rotary_emb = F.pad(rotary_emb, (0, 0, 0, 0, 0, padded_length))
-        temb = F.pad(temb, (0, 0, 0, padded_length))
-        timestep_proj = F.pad(timestep_proj, (0, 0, 0, 0, 0, padded_length))
-
-        # e.g. [360,360,264,264,32]
-        split_list = [latent_hidden_states.shape[1], 
-                      condition_latent_hidden_states.shape[1], 
-                      action_hidden_states.shape[1], 
-                      condition_action_hidden_states.shape[1],
-                      padded_length]
-        
-        # noisy_latents: (1,48,3,24,20)
-        # action_dict noisy_latents : (1, 30, 3, 88, 1)
-        # padded_length = 32
-        # chunk_size = 3
-        # window_size = 9
-        # patch_size = [1,2,2]
-        FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
-                               action_dict['noisy_latents'].shape, 
-                               padded_length, 
-                               input_dict["chunk_size"],
-                               window_size=input_dict['window_size'],
-                               patch_size=self.patch_size,
-                               device=hidden_states.device
-                               )
-
-        for layer, block in enumerate(self.blocks):
-            # hidden_states = (1,1280,3072)
-            # text_hidden_states = (1，33，3072) -> (1,128,3072)
-            torch.cuda.synchronize()
-            hidden_states = block(
-                hidden_states,
-                text_hidden_states,
-                timestep_proj,
-                rotary_emb,
-                update_cache=False
-            )
-            torch.cuda.synchronize()
-            if layer == self.future_align_layer:
-                align_hidden_states_future, _, _, _, _ = torch.split(hidden_states, split_list, dim=1)
-                align_hidden_states_future = rearrange(
-                    align_hidden_states_future,
-                    '1 (b l) c -> b l c',
-                    b=batch_size,
-                )
-                loss_future = self.aligner(
-                    align_hidden_states_future,
-                    future_trace_hidden_states,
-                    tokens,
-                    alignment_modules,
-                    align_key='future',
-                )
-                
-            if layer == self.motion_align_layer:
-                align_hidden_states_motion, _, _, _, _ = torch.split(hidden_states, split_list, dim=1)
-                align_hidden_states_motion = rearrange(
-                    align_hidden_states_motion,
-                    '1 (b l) c -> b l c',
-                    b=batch_size,
-                )
-                loss_motion = self.aligner(
-                    align_hidden_states_motion,
-                    motion_trace_hidden_states,
-                    tokens,
-                    alignment_modules,
-                    align_key='dynamic',
-                )
-                
-        temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
-        shift, scale = rearrange(temb_scale_shift_table,
-                                 'b l n c -> b n l c').chunk(2, dim=1)
-        shift = shift.to(hidden_states.device).squeeze(1)
-        scale = scale.to(hidden_states.device).squeeze(1)
-        hidden_states = (self.norm_out(hidden_states.float()) *
-                                (1. + scale) +
-                                shift).type_as(hidden_states)
-        latent_hidden_states, _, action_hidden_states, _, _ = torch.split(hidden_states, split_list, dim=1)
-        latent_hidden_states = self.proj_out(latent_hidden_states)
-        latent_hidden_states = rearrange(
-            latent_hidden_states,
-            '1 (b l) (n c) -> b (l n) c',
-            n=math.prod(self.patch_size), b=batch_size
-        )  # batch, sequence = l, n = h * w, c = dim
-        action_hidden_states = self.action_proj_out(action_hidden_states)
-        action_hidden_states = rearrange(action_hidden_states,
-                                             '1 (b l) c -> b l c',
-                                             b=batch_size)  #
-
-
-        if 'trace' in input_dict:
-            if loss_future is None or loss_motion is None:
-                raise ValueError(
-                    "Trace alignment layers were not reached. "
-                    f"future_align_layer={self.future_align_layer}, "
-                    f"motion_align_layer={self.motion_align_layer}, "
-                    f"num_layers={self.num_layers}"
-                )
-            return latent_hidden_states, action_hidden_states, (loss_future, loss_motion)
-        
-        return latent_hidden_states, action_hidden_states
-
-    def forward_train_manifold(
+    def _condition_key_attention_from_probs(
         self,
-        input_dict,
-        alignment_modules=None,
+        attn_probs,
+        latent_query_length,
+        condition_key_length,
+        batch_size,
+        frames,
+        tokens,
+        temporal_mask,
     ):
+        expected_latent_length = batch_size * frames * tokens
+        if latent_query_length != expected_latent_length or condition_key_length != expected_latent_length:
+            raise ValueError(
+                "Latent attention slice does not match TA teacher shape: "
+                f"query={latent_query_length}, key={condition_key_length}, "
+                f"expected={expected_latent_length}"
+            )
+
+        if attn_probs.shape[0] != 1:
+            raise ValueError(f"Expected flattened training batch in attention dim 0, got {attn_probs.shape[0]}")
+        if attn_probs.shape[-2:] != (latent_query_length, condition_key_length):
+            raise ValueError(
+                "Expected local attention probs with shape [1, heads, noisy_len, condition_len], got "
+                f"{attn_probs.shape}"
+            )
+
+        condition_probs = attn_probs[0].reshape(
+            attn_probs.shape[1],
+            batch_size,
+            frames,
+            tokens,
+            batch_size,
+            frames,
+            tokens,
+        )
+        condition_probs = torch.stack(
+            [condition_probs[:, batch_idx, :, :, batch_idx, :, :] for batch_idx in range(batch_size)],
+            dim=1,
+        )
+        condition_probs = condition_probs * temporal_mask[None, None, :, None, :, None]
+        return condition_probs.mean(dim=(0, 3))
+
+    def _temporal_masked_attention_coverage_loss(
+        self,
+        condition_attention,
+        temporal_mask,
+        ta_feat=None,
+        ta_teacher=None,
+        teacher_temperature=1.0,
+        teacher_use_delta=True,
+        eps=1e-6,
+    ):
+        from .alignment import ta_to_attention_teacher
+
+        if ta_teacher is None:
+            if ta_feat is None:
+                raise ValueError("Either ta_feat or ta_teacher must be provided")
+            ta_teacher = ta_to_attention_teacher(ta_feat, use_delta=teacher_use_delta)
+            ta_teacher = torch.softmax(ta_teacher / teacher_temperature, dim=-1)
+        else:
+            ta_teacher = ta_teacher.to(device=condition_attention.device)
+
+        if condition_attention.shape[0] != ta_teacher.shape[0] or condition_attention.shape[-2:] != ta_teacher.shape[1:]:
+            raise ValueError(
+                "condition_attention and ta_teacher must agree on batch/key-frame/token dims, got "
+                f"{condition_attention.shape} vs {ta_teacher.shape}"
+            )
+
+        teacher = ta_teacher[:, None] * temporal_mask[None, :, :, None]
+        attention = condition_attention * temporal_mask[None, :, :, None]
+
+        valid_queries = temporal_mask.any(dim=-1)
+        if not valid_queries.any():
+            return condition_attention.new_zeros(())
+
+        attention = attention / (attention.sum(dim=(-2, -1), keepdim=True) + eps)
+        teacher = teacher / (teacher.sum(dim=(-2, -1), keepdim=True) + eps)
+        reward = (attention * teacher.detach()).sum(dim=(-2, -1))
+
+        return -reward[:, valid_queries].mean()
+
+    def forward_train_attn(self, input_dict, alignment_modules=None):
         input_dict['latent_dict']['noisy_latents'] = input_dict['latent_dict']['noisy_latents'].to(torch.bfloat16)
         input_dict['latent_dict']['latent'] = input_dict['latent_dict']['latent'].to(torch.bfloat16)
         input_dict['action_dict']['noisy_latents'] = input_dict['action_dict']['noisy_latents'].to(torch.bfloat16)
@@ -1077,22 +1092,21 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         latent_dict = input_dict['latent_dict']
         action_dict = input_dict['action_dict']
         batch_size = latent_dict['noisy_latents'].shape[0]
+        latent_token_frames = latent_dict['noisy_latents'].shape[2] // self.patch_size[0]
+        # attn_align_layer = self._resolve_attention_align_layer(input_dict)
 
         latent_hidden_states = self._input_embed(latent_dict['noisy_latents'], input_type='latent').flatten(0, 1)[None]
         action_hidden_states = self._input_embed(action_dict['noisy_latents'], input_type='action').flatten(0, 1)[None]
-        text_hidden_states = self._input_embed(latent_dict["text_emb"], input_type='text')
-        text_hidden_states = text_hidden_states.flatten(0, 1)[None]
+        text_hidden_states = self._input_embed(latent_dict["text_emb"], input_type='text').flatten(0, 1)[None]
 
         condition_latent_hidden_states = self._input_embed(latent_dict['latent'], input_type='latent').flatten(0, 1)[None]
         condition_action_hidden_states = self._input_embed(action_dict['latent'], input_type='action').flatten(0, 1)[None]
 
-        if 'trace' in input_dict:
-            input_dict['trace'] = input_dict['trace'].to(torch.bfloat16)
-            raw_trace_hidden_states, tokens = self.downsample_trace(input_dict['trace'], latent_dict['noisy_latents'].shape[2])
-            future_trace_hidden_states = raw_trace_hidden_states
-            motion_trace_hidden_states = raw_trace_hidden_states
-            loss_future = None
-            loss_motion = None
+        ta_feat, ta_teacher, teacher_frames, teacher_tokens = self._prepare_attention_teacher(
+            input_dict,
+            latent_token_frames,
+            latent_hidden_states.device,
+        )
 
         hidden_states = torch.cat([
             latent_hidden_states,
@@ -1153,49 +1167,71 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             patch_size=self.patch_size,
             device=hidden_states.device,
         )
+        temporal_mask = self._latent_temporal_condition_mask(
+            teacher_frames,
+            input_dict["chunk_size"],
+            input_dict['window_size'],
+            hidden_states.device,
+        )
+        noisy_to_condition_mask = self._noisy_to_condition_latent_mask(
+            batch_size,
+            teacher_frames,
+            teacher_tokens,
+            temporal_mask,
+        )
 
-        align_hidden_states_future = None
-        align_hidden_states_motion = None
+        loss_attn = None
+        noisy_latent_len, condition_latent_len, _, _, _ = split_list
+        noisy_latent_q_start = 0
+        noisy_latent_q_length = noisy_latent_len
+        condition_latent_k_start = noisy_latent_len
+        condition_latent_k_length = condition_latent_len
+        attn_slice = (
+            noisy_latent_q_start,
+            noisy_latent_q_length,
+            condition_latent_k_start,
+            condition_latent_k_length,
+        )
+        
         for layer, block in enumerate(self.blocks):
-            torch.cuda.synchronize()
-            hidden_states = block(
+            capture_attn = layer == self.align_layer
+            block_output = block(
                 hidden_states,
                 text_hidden_states,
                 timestep_proj,
                 rotary_emb,
                 update_cache=False,
+                return_attn_probs=capture_attn,
+                attn_slice=attn_slice if capture_attn else None,
+                attn_slice_mask=noisy_to_condition_mask if capture_attn else None,
             )
-            torch.cuda.synchronize()
+            if capture_attn:
+                hidden_states, attn_probs = block_output
+                condition_attention = self._condition_key_attention_from_probs(
+                    attn_probs,
+                    noisy_latent_q_length,
+                    condition_latent_k_length,
+                    batch_size,
+                    teacher_frames,
+                    teacher_tokens,
+                    temporal_mask,
+                )
+                loss_attn = self._temporal_masked_attention_coverage_loss(
+                    condition_attention,
+                    temporal_mask,
+                    ta_feat=ta_feat,
+                    ta_teacher=ta_teacher,
+                    teacher_temperature=self.attn_teacher_temperature,
+                    teacher_use_delta=self.attn_teacher_use_delta,
+                )
+            else:
+                hidden_states = block_output
 
-            if layer == self.future_align_layer:
-                align_hidden_states_future, _, _, _, _ = torch.split(hidden_states, split_list, dim=1)
-                align_hidden_states_future = rearrange(
-                    align_hidden_states_future,
-                    '1 (b l) c -> b l c',
-                    b=batch_size,
-                )
-                loss_future = self.aligner(
-                    align_hidden_states_future,
-                    future_trace_hidden_states.detach(),
-                    tokens,
-                    alignment_modules,
-                    align_key='future',
-                )
-
-            if layer == self.motion_align_layer:
-                align_hidden_states_motion, _, _, _, _ = torch.split(hidden_states, split_list, dim=1)
-                align_hidden_states_motion = rearrange(
-                    align_hidden_states_motion,
-                    '1 (b l) c -> b l c',
-                    b=batch_size,
-                )
-                loss_motion = self.aligner(
-                    align_hidden_states_motion,
-                    motion_trace_hidden_states.detach(),
-                    tokens,
-                    alignment_modules,
-                    align_key='dynamic',
-                )
+        if loss_attn is None:
+            raise ValueError(
+                "Attention alignment layer was not reached. "
+                f"attn_align_layer={attn_align_layer}, num_layers={self.num_layers}"
+            )
 
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table, 'b l n c -> b n l c').chunk(2, dim=1)
@@ -1213,18 +1249,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         action_hidden_states = self.action_proj_out(action_hidden_states)
         action_hidden_states = rearrange(action_hidden_states, '1 (b l) c -> b l c', b=batch_size)
 
-        if 'trace' not in input_dict:
-            return latent_hidden_states, action_hidden_states
-
-        if loss_future is None or loss_motion is None:
-            raise ValueError(
-                "Trace alignment layers were not reached. "
-                f"future_align_layer={self.future_align_layer}, "
-                f"motion_align_layer={self.motion_align_layer}, "
-                f"num_layers={self.num_layers}"
-            )
-
-        return latent_hidden_states, action_hidden_states, (loss_future, loss_motion)
+        return latent_hidden_states, action_hidden_states, loss_attn
     
     def aligner(self, align_hidden_states, trace_hidden_states, tokens, align_modules, align_key = 'dynamic'):
         if align_modules is None or align_key not in align_modules:
@@ -1400,6 +1425,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         cache_name="pos",
         action_mode=False,
         train_mode=False,
+        train_attn_mode=False,
         alignment_module = None,
         alignment_modules = None,
     ):
@@ -1422,6 +1448,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
+        if train_attn_mode:
+            return self.forward_train_attn(input_dict, alignment_modules or alignment_module)
         if train_mode:
             return self.forward_train_manifold(input_dict, alignment_modules or alignment_module)
         if action_mode:  # action input emb
