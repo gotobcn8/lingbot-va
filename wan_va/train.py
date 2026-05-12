@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 import wandb
 
+os.environ.setdefault("HF_DATASETS_CACHE", "/tmp/hf_datasets_cache")
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -37,6 +39,9 @@ from modules.utils import (
 from modules.alignment import (
     future_alignment_loss,
     motion_incremental_alignment,
+    motion_incremental_alignment_tokenwise,
+    destination_loss_safe,
+    unified_dest_and_motion,
 )
 from utils import (
     init_logger, 
@@ -83,7 +88,16 @@ class Trainer:
         self.enable_trace = config.enable_trace
         self.trace_coef = getattr(config, 'trace_coef', 0.05)
         self.K_frames = getattr(config, 'K_frames', 3)
-        self.align_layer = getattr(config, 'align_layer', 20)
+        self.align_layer = getattr(config, 'align_layer', 16)
+        
+        self.loss_weights = getattr(
+            config, 'loss_weights', {
+                'dest_loss':0.01,
+                'motion_loss':0.01,
+                'trace_loss':0.01,                                     
+            }
+        )
+        
         # Load models
         logger.info("Loading models...")
 
@@ -162,7 +176,7 @@ class Trainer:
             shuffle=(train_sampler is None), 
             num_workers=config.load_worker,
             sampler=train_sampler,
-            # collate_fn = collate_get_mask,
+            collate_fn=collate_get_mask,
         )
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
@@ -181,16 +195,24 @@ class Trainer:
     def _add_noise(self, latent, train_scheduler, action_mask=False, action_mode=False, noisy_cond_prob=0.):
         B, C, F, H, W = latent.shape
 
+        # sample timesteps for each frame, it's for frames only!
+        # timestep_ids.shape = [F]
         timestep_ids = sample_timestep_id(batch_size=F, num_train_timesteps=train_scheduler.num_train_timesteps)
+        # noise generation
         noise = torch.zeros_like(latent).normal_()
+        # actual timesteps from timestep_ids: [F]
         timesteps = train_scheduler.timesteps[timestep_ids].to(device=self.device)
+        # each frame adds noise with different level of 
+        # timesteps: frame1:[10], frame2:[20], frame3[15]
         noisy_latents =train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
+        # target = noise - latent
         targets =train_scheduler.training_target(latent, noise, timesteps)
 
         patch_f, patch_h, patch_w = self.patch_size
         if action_mode:
             patch_f = patch_h = patch_w = 1
         
+        # generate positional embeds
         latent_grid_id = get_mesh_id(
             latent.shape[-3] // patch_f,  # F
             latent.shape[-2] // patch_h,  # H
@@ -199,9 +221,10 @@ class Trainer:
             f_w=1,
             f_shift=0,
             action=action_mode
-        ).to(self.device)  # shape: [4, seq_len]
+        ).to(self.device)  # shape: [4, seq_len] t / f / h / w , be implemented flex attn???
         latent_grid_id = latent_grid_id[None].repeat(B, 1, 1)
 
+        # add noise for condition as well
         if torch.rand(1).item() < noisy_cond_prob:
             cond_timestep_ids = sample_timestep_id(
                     batch_size=F,
@@ -215,6 +238,7 @@ class Trainer:
         else:
             cond_timesteps = torch.zeros_like(timesteps)
 
+        #  mask
         if action_mask is not None:
             noisy_latents *= action_mask.float()
             targets *= action_mask.float()
@@ -257,8 +281,6 @@ class Trainer:
                 batch_dict['text_emb'],
                 (0, 0, 0, config.max_tokens - T),  # (D_left, D_right, T_left, T_right)
             )
-        if B == 1:
-            batch_dict['text_active_length'] = T
         if batch_dict['text_emb'].dtype != torch.bfloat16:
             batch_dict['text_emb'] = batch_dict['text_emb'].to(torch.bfloat16)
         if D != 4096:
@@ -281,7 +303,6 @@ class Trainer:
             'action_dict': action_dict,
             'chunk_size': torch.randint(1, 5, (1,)).item(),
             'window_size': torch.randint(4, 65, (1,)).item(),
-            'text_active_length': batch_dict['text_active_length'],
         }
 
         if 'trace' in batch_dict:
@@ -291,9 +312,16 @@ class Trainer:
 
     def convert_input_format(self, input_dict):
         """Convert input dict to match transformer input format if needed."""
-        for key, value in input_dict.items():
-            input_dict[key] = value.to(self.device)#.to(self.dtype)
-        return input_dict
+        def move_to_device(value):
+            if torch.is_tensor(value):
+                return value.to(self.device)
+            if isinstance(value, dict):
+                return {k: move_to_device(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [move_to_device(v) for v in value]
+            return value
+
+        return {key: move_to_device(value) for key, value in input_dict.items()}
 
     def compute_loss(self,
         input_dict,
@@ -339,8 +367,37 @@ class Trainer:
         action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
         action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
 
-        return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps, (alignment_loss * self.trace_coef) / self.gradient_accumulation_steps
+        if not isinstance(alignment_loss, dict):
+            alignment_loss = {
+                'trace_loss': alignment_loss
+            }
+        alignment_loss = self.formulize_traceloss(alignment_loss)
+        
+        return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps, alignment_loss
 
+    
+    def formulize_traceloss(self, alignment_loss):
+        # alignment_loss['dest_loss'] *= loss_weights['dest_weight']
+        # alignment_loss['motion_loss'] *= loss_weights['motion_weight']
+        # alignment_loss['total'] = 0
+        for key in alignment_loss:
+            alignment_loss[key] *= self.loss_weights[key]
+            alignment_loss[key] /= self.gradient_accumulation_steps
+            # alignment_loss['total'] += alignment_loss[key]
+        
+        alignment_loss['total'] = sum([alignment_loss[key] for key in alignment_loss])
+        
+        return alignment_loss
+    
+    def _build_alignment_show(self,accumulated_align_losses):
+        alignment_loss_show = {}
+        max_alignment_loss_show = {}
+        for key in accumulated_align_losses:
+            alignment_loss_show[key] = dist_mean(torch.stack(accumulated_align_losses[key]).sum()).detach().cpu().item() if self.enable_trace else 0
+            max_alignment_loss_show[key] = dist_max(torch.stack(accumulated_align_losses[key]).sum()).detach().cpu().item() if self.enable_trace else 0
+        
+        return alignment_loss_show, max_alignment_loss_show
+    
     def _finalize_optimizer_step(
         self,
         accumulated_latent_losses,
@@ -362,8 +419,10 @@ class Trainer:
         max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
         max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
 
-        alignment_loss_show = dist_mean(torch.stack(accumulated_align_losses).sum()).detach().cpu().item() if self.enable_trace else 0
-        max_alignment_loss_show = dist_max(torch.stack(accumulated_align_losses).sum()).detach().cpu().item() if self.enable_trace else 0
+        # alignment_loss_show = dist_mean(torch.stack(accumulated_align_losses).sum()).detach().cpu().item() if self.enable_trace else 0
+        # max_alignment_loss_show = dist_max(torch.stack(accumulated_align_losses).sum()).detach().cpu().item() if self.enable_trace else 0
+
+        alignment_loss_show, max_alignment_loss_show = self._build_alignment_show(accumulated_align_losses)
 
         torch.cuda.synchronize()
         if self.step % self.config.gc_interval == 0:
@@ -372,25 +431,32 @@ class Trainer:
 
         if self.config.rank == 0:
             progress_bar.n += num_accumulated_batches
-            progress_bar.set_postfix({
+            postfix = {
                 'latent_loss': f'{latent_loss_show:.5f}',
                 'action_loss': f'{action_loss_show:.5f}',
-                'alignment_loss': f'{alignment_loss_show:.5f}',
+                # 'alignment_loss': f'{alignment_loss_show:.5f}',
                 'step': self.step,
                 'grad_norm': f'{total_norm.item():.3f}',
                 'lr': f'{lr:.2e}'
-            })
+            }
+            for key in alignment_loss_show:
+                postfix[key] = f'{alignment_loss_show[key]:.5f}'
+            progress_bar.set_postfix(postfix)
             if self.config.enable_wandb:
                 wandb_metrics = {
                     'loss_metrics/global_avg_video_loss': latent_loss_show,
                     'loss_metrics/global_avg_action_loss': action_loss_show,
-                    'loss_metrics/global_avg_alignment_loss': alignment_loss_show,
+                    # 'loss_metrics/global_avg_alignment_loss': alignment_loss_show,
                     'loss_metrics/global_max_video_loss': max_latent_loss_show,
                     'loss_metrics/global_max_action_loss': max_action_loss_show,
-                    'loss_metrics/global_max_alignment_loss': max_alignment_loss_show,
+                    # 'loss_metrics/global_max_alignment_loss': max_alignment_loss_show,
                     'grad_norm': total_norm.item(),
                     'lr': lr,
                 }
+                for key in alignment_loss_show:
+                    wandb_metrics[f'loss_metrics/global_max_{key}'] = max_alignment_loss_show[key]
+                    wandb_metrics[f'loss_metrics/global_avg_{key}'] = alignment_loss_show[key]
+                    
                 self.wandb.log(wandb_metrics, step=self.step)
 
         self.step += 1
@@ -399,6 +465,23 @@ class Trainer:
                 logger.info(f"Starting save model at step {self.step}")
             self.save_checkpoint()
 
+    def build_alignment_loss_accumulated(self, alignment_loss, accumulated_align_losses):
+        for key in alignment_loss:
+            # if key != 'total':
+            # print(alignment_loss[key],accumulated_align_losses)
+            if key not in accumulated_align_losses:
+                accumulated_align_losses[key] = []
+            accumulated_align_losses[key].append(alignment_loss[key].detach() if self.enable_trace else 0)
+
+        return accumulated_align_losses
+
+    def clear_alignment_loss_accumulated(self, alignment_loss, accumulated_align_losses):
+        for key in alignment_loss:
+            # if key != 'total':
+            accumulated_align_losses[key] = []
+            
+        return accumulated_align_losses
+    
     def _run_train_micro_step(
         self,
         input_dict,
@@ -415,32 +498,38 @@ class Trainer:
         )
         self.transformer.set_requires_gradient_sync(should_sync)
 
-        output = self.transformer(input_dict, alignment_module=motion_incremental_alignment, train_mode=True)
+        output = self.transformer(input_dict, alignment_module=unified_dest_and_motion, train_mode=True)
         latent_loss, action_loss, alignment_loss = self.compute_loss(input_dict, output)
-        loss = latent_loss + action_loss + alignment_loss
+        loss = latent_loss + action_loss + alignment_loss['total']
 
         loss.backward()
 
         accumulated_latent_losses.append(latent_loss.detach())
         accumulated_action_losses.append(action_loss.detach())
-        accumulated_align_losses.append(alignment_loss.detach() if self.enable_trace else 0)
-
+        
+        
+        # accumulated_align_losses.append(alignment_loss.detach() if self.enable_trace else 0)
+        accumulated_align_losses = self.build_alignment_loss_accumulated(alignment_loss, accumulated_align_losses)
+        
         if should_sync:
             self._finalize_optimizer_step(
                 accumulated_latent_losses,
                 accumulated_action_losses,
                 accumulated_align_losses,
+                # alignment_loss,
                 progress_bar,
             )
             accumulated_latent_losses = []
             accumulated_action_losses = []
-            accumulated_align_losses = []
+            # accumulated_align_losses = []
+            self.clear_alignment_loss_accumulated(alignment_loss, accumulated_align_losses)
 
         return (
             valid_batch_count + 1,
             accumulated_latent_losses,
             accumulated_action_losses,
             accumulated_align_losses,
+            # alignment_loss,
         )
 
     def train_epoch(self):
@@ -458,10 +547,12 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         accumulated_latent_losses = []
         accumulated_action_losses = []
-        accumulated_align_losses = []
+        accumulated_align_losses = {}
         valid_batch_count = 0
         pending_input_dict = None
         for batch in self.train_loader:
+            if self.step >= self.config.num_steps:
+                break
             batch = self.convert_input_format(batch)
 
             input_dict = self._prepare_input_dict(batch, self.config)
@@ -486,7 +577,7 @@ class Trainer:
 
             pending_input_dict = input_dict
 
-        if pending_input_dict is not None:
+        if pending_input_dict is not None and self.step < self.config.num_steps:
             (
                 valid_batch_count,
                 accumulated_latent_losses,
@@ -630,6 +721,16 @@ def run(args):
 
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
+    if args.gradient_accumulation_steps is not None:
+        config.gradient_accumulation_steps = args.gradient_accumulation_steps
+    if args.num_steps is not None:
+        config.num_steps = args.num_steps
+    if args.load_worker is not None:
+        config.load_worker = args.load_worker
+    if args.disable_wandb:
+        config.enable_wandb = False
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
@@ -653,6 +754,35 @@ def main():
         type=str,
         default=None,
         help="Root directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override training batch size",
+    )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=None,
+        help="Override gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--num-steps",
+        type=int,
+        default=None,
+        help="Override total optimizer steps",
+    )
+    parser.add_argument(
+        "--load-worker",
+        type=int,
+        default=None,
+        help="Override DataLoader worker count",
+    )
+    parser.add_argument(
+        "--disable-wandb",
+        action="store_true",
+        help="Disable wandb logging regardless of config",
     )
 
     args = parser.parse_args()

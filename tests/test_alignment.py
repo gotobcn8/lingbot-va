@@ -69,3 +69,38 @@ def test_motion_incremental_alignment_raises_for_unknown_pool():
 
     with pytest.raises(ValueError, match="Unknown pool type"):
         alignment.motion_incremental_alignment(x, x.clone(), Tokens=3, pool="sum")
+
+
+def test_build_topk_dest_prob_keeps_only_top_tokens():
+    score = torch.tensor([[1.0, 4.0, 2.0, 3.0]])
+
+    prob = alignment.build_topk_dest_prob(score, topk_ratio=0.5, tau=1.0)
+
+    assert prob.shape == score.shape
+    assert torch.isclose(prob.sum(), torch.tensor(1.0), atol=1e-6)
+    assert prob[0, 0].item() == 0.0
+    assert prob[0, 2].item() == 0.0
+    assert prob[0, 1].item() > 0.0
+    assert prob[0, 3].item() > 0.0
+
+
+def test_destination_loss_safe_runs_and_backpropagates():
+    h = torch.randn(2, 3, 4, 5, requires_grad=True)
+    ta = torch.randn(2, 3, 4, 5)
+
+    loss = alignment.destination_loss_safe(h, ta, Tokens=4)
+
+    assert loss.shape == torch.Size([])
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert h.grad is not None
+
+
+def test_destination_loss_safe_accepts_flat_sequence():
+    h = torch.randn(1, 6, 3, requires_grad=True)
+    ta = torch.randn(1, 6, 3)
+
+    loss = alignment.destination_loss_safe(h, ta, Tokens=2)
+
+    assert loss.shape == torch.Size([])
+    assert torch.isfinite(loss)

@@ -171,7 +171,6 @@ class FlexAttnFunc(nn.Module):
         latent_shape, 
         action_shape, 
         padded_length, 
-        text_active_length,
         chunk_size,
         window_size,
         patch_size,
@@ -895,7 +894,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         temb = torch.cat([latent_temb, action_temb], dim=1)
         timestep_proj = torch.cat([latent_timestep_proj, action_timestep_proj], dim=1)
 
-        text_active_length = input_dict.get('text_active_length', MAX_TEXT_LEN)
         total_length = hidden_states.shape[1]
         padded_length = (128 - total_length % 128) % 128
         hidden_states = F.pad(hidden_states, (0, 0, 0, padded_length))
@@ -919,7 +917,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
                                action_dict['noisy_latents'].shape, 
                                padded_length, 
-                               text_active_length,
                                input_dict["chunk_size"],
                                window_size=input_dict['window_size'],
                                patch_size=self.patch_size,
@@ -964,6 +961,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         # cos_sim = F.cosine_similarity(align_hidden_states, h_new, dim=-1) / temperature
         # loss = 1 - cos_sim.mean()
         if 'trace' in input_dict:
+            align_hidden_states = rearrange(
+                align_hidden_states,
+                '1 (b l) c -> b l c',
+                b=batch_size,
+            )
             align_hidden_states = self.align_repr_proj(align_hidden_states)
             trace_hidden_states = self.trace_proj(trace_hidden_states)
             # trace_loss = alignment_module(align_hidden_states, trace_hidden_states, K = self.K_frames, Tokens = tokens)

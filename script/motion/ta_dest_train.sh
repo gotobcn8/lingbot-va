@@ -9,7 +9,7 @@ MASTER_PORT=${MASTER_PORT:-"29501"}
 PORT=${PORT:-"1106"}
 LOG_RANK=${LOG_RANK:-"0"}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
-CONFIG_NAME=${CONFIG_NAME:-"motion_train"}
+CONFIG_NAME=${CONFIG_NAME:-"dest_train"}
 PYTHON_BIN=${PYTHON_BIN:-"/root/miniconda3/envs/lingbot/bin/python"}
 
 overrides=""
