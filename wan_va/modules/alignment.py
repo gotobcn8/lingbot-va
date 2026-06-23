@@ -25,105 +25,70 @@ def create_future_alignment_mask(F, K, device='cuda'):
     return mask
 
 
-def future_alignment_loss(a, b, K=3, Tokens = 192, temperature=1.0, mask_type='window'):
+def future_alignment_loss(a, b, K=3, Tokens=192, temperature=1.0, mask_type='window'):
     """
-    Future frame alignment
-    
+    Future frame alignment.
+
     Args:
-        a: (B, Fa, T, D) - source repr
-        b: (B, Fb, T, D) - target repr ()
+        a: (B, F*Tokens, D) source representation
+        b: (B, F*Tokens, D) target representation
         K: aligned future frames
+        Tokens: number of tokens per frame
         temperature: temperature coef
-        mask_type: 'triangular' (low triangle) or 'window' (slide window)
-        
+        mask_type: 'triangular' or 'window'
+
     Returns:
         loss: scalar loss
     """
-    # B, Fa, T, D = a.shape
-    # _, Fb, _, _ = b.shape
-    B, Fa, D = a.shape
-    _, Fb, _ = b.shape
-    # print(B,Fa,D,Fb)
+    B, _, D = a.shape
 
     a = a.reshape(-1, Tokens, D)
     b = b.reshape(-1, Tokens, D)
     Fa, Fb = a.shape[0], b.shape[0]
-    # 1. normalization feature
-    a_norm = F.normalize(a, dim=-1)  # (B, Fa, T, D)
-    b_norm = F.normalize(b, dim=-1)  # (B, Fb, T, D)
-    
-    # 2. compute token-level similarity matrix
-    # 对每个 batch 独立计算，并考虑 token 对应关系
-    # 形状: (B, Fa, T, Fb, T) - 太大会爆内存，改用更高效的方式
-    # 由于 B 始终为 1，可以简化
+
+    a_norm = F.normalize(a, dim=-1)
+    b_norm = F.normalize(b, dim=-1)
+
     if B == 1:
-        # 去掉 batch 维度
-        a_norm = a_norm.squeeze(0)  # (Fa, T, D)
-        b_norm = b_norm.squeeze(0)  # (Fb, T, D)
-        
-        # 计算相似度: 相同 token 位置之间计算
-        cos_sim = torch.einsum('ftd,gtd->ftg', a_norm, b_norm)  # (Fa, T, Fb)
+        a_norm = a_norm.squeeze(0)
+        b_norm = b_norm.squeeze(0)
+        cos_sim = torch.einsum('ftd,gtd->ftg', a_norm, b_norm)
     else:
-        # 如果 B > 1，使用批量计算
-        # 先 reshape: (B, Fa*T, D) 和 (B, Fb*T, D)
-        a_flat = a_norm.view(B, Fa * T, D)
-        b_flat = b_norm.view(B, Fb * T, D)
-        
-        # 计算相似度矩阵: (B, Fa*T, Fb*T)
+        a_flat = a_norm.view(B, Fa * Tokens, D)
+        b_flat = b_norm.view(B, Fb * Tokens, D)
         cos_sim_flat = torch.bmm(a_flat, b_flat.transpose(1, 2))
-        
-        # 然后 reshape 回 (B, Fa, T, Fb, T)
-        cos_sim = cos_sim_flat.view(B, Fa, T, Fb, T)
-    
-    # 3. 创建对齐 mask
+        cos_sim = cos_sim_flat.view(B, Fa, Tokens, Fb, Tokens)
+        cos_sim = cos_sim.diagonal(dim1=2, dim2=4).permute(0, 1, 3, 2)
+
     if mask_type == 'triangular':
-        # a[t] 对齐 b[t+1:] (需要 Fa == Fb)
         if Fa != Fb:
             raise ValueError(f"Triangular mask requires Fa == Fb, but got Fa={Fa}, Fb={Fb}")
-        frame_mask = torch.tril(torch.ones(Fa, Fb), diagonal=-1).bool()
-        
+        frame_mask = torch.tril(torch.ones(Fa, Fb, dtype=torch.bool), diagonal=-1)
     elif mask_type == 'window':
-        # a[t] 对齐 b[t+1:t+K+1] (支持 Fa != Fb)
         frame_mask = torch.zeros(Fa, Fb, dtype=torch.bool)
         for i in range(Fa):
-            for j in range(i, min(i+K, Fb)):
+            for j in range(i, min(i + K, Fb)):
                 frame_mask[i, j] = True
     else:
         raise ValueError(f"Unknown mask_type: {mask_type}")
-    
-    frame_mask = frame_mask.to(a.device)  # (Fa, Fb)
-    
-    # 4. 计算损失
+
+    frame_mask = frame_mask.to(a.device)
+
     if B == 1:
-        # 处理单个 batch
-        # 扩展到 token 维度
-        token_mask = frame_mask[:, None, :]  # (Fa, 1, Fb)
-        token_mask = token_mask.expand(Fa, Tokens, Fb)  # (Fa, T, Fb)
-        
-        # 提取有效相似度
-        valid_sims = cos_sim[token_mask]  # (num_pairs,)
+        token_mask = frame_mask[:, None, :].expand(Fa, Tokens, Fb)
     else:
-        # 处理多个 batch
-        # 扩展 mask 到 batch 和 token 维度
-        token_mask = frame_mask[None, :, None, :]  # (1, Fa, 1, Fb)
-        token_mask = token_mask.expand(B, Fa, Tokens, Fb)  # (B, Fa, T, Fb)
-        
-        # 提取有效相似度（需要先 reshape）
-        cos_sim_reshaped = cos_sim.view(B, Fa, Tokens, Fb)  # 忽略最后一个 T 维度，因为我们只关心相同 token 位置
-        valid_sims = cos_sim_reshaped[token_mask]  # (num_pairs,)
-    
+        token_mask = frame_mask[None, :, :, None].expand(B, Fa, Fb, Tokens)
+
+    valid_sims = cos_sim[token_mask]
+
     if len(valid_sims) == 0:
         return torch.tensor(0.0, device=a.device)
-    
-    # 5. 计算损失
-    loss = 1 - valid_sims.mean()
-    
-    # 可选: 使用 temperature 缩放
+
     if temperature != 1.0:
-        loss = 1 - (valid_sims / temperature).mean()
-    
-    # print(f"frame_mask has {frame_mask.sum().item()} True entries")
-    return loss
+        valid_sims = valid_sims / temperature
+
+    return 1 - valid_sims.mean()
+
 
 def motion_incremental_alignment(
     a,
@@ -197,7 +162,13 @@ def motion_incremental_alignment(
 
     return loss
 
-def motion_incremental_alignment_tokenwise(a, b, Tokens=192, eps=1e-8):
+def motion_incremental_alignment_tokenwise(
+    a,
+    b,
+    Tokens=192,
+    motion_weight=None,
+    eps=1e-8,
+):
     """
     Token-wise motion incremental alignment.
 
@@ -231,7 +202,21 @@ def motion_incremental_alignment_tokenwise(a, b, Tokens=192, eps=1e-8):
     delta_b = F.normalize(delta_b, dim=-1, eps=eps)
 
     cos_sim = (delta_a * delta_b).sum(dim=-1)   # (B, F-1, Tokens)
-    loss = 1.0 - cos_sim.mean()
+    loss_each_token = (1.0 - cos_sim).mean(dim=1)   # (B, Tokens)
+
+    if motion_weight is None:
+        loss = loss_each_token.mean()
+    else:
+        if motion_weight.shape != loss_each_token.shape:
+            raise ValueError(
+                "motion_weight must have shape [B, Tokens], "
+                f"got {motion_weight.shape} for token loss shape {loss_each_token.shape}"
+            )
+        motion_weight = motion_weight.detach().to(
+            device=loss_each_token.device,
+            dtype=loss_each_token.dtype,
+        )
+        loss = (motion_weight * loss_each_token).sum() / (motion_weight.sum() + eps)
 
     return loss
 
@@ -259,6 +244,42 @@ def build_topk_dest_prob(
     masked_score.scatter_(dim=-1, index=topk_idx, src=dest_score.gather(-1, topk_idx))
     prob = torch.softmax(masked_score / max(tau, eps), dim=-1)
     return prob / (prob.sum(dim=-1, keepdim=True) + eps)
+
+
+def reshape_token_sequence(x, tokens_per_frame, name):
+    if x.dim() == 3:
+        B, seq_len, _ = x.shape
+        if seq_len % tokens_per_frame != 0:
+            raise ValueError(
+                f"{name} seq_len={seq_len} is not divisible by tokens_per_frame={tokens_per_frame}"
+            )
+        return x.reshape(B, seq_len // tokens_per_frame, tokens_per_frame, -1)
+
+    if x.dim() == 4:
+        return x
+
+    raise ValueError(
+        f"Expected {name} with shape [B,F,T,D] or [B,F*T,D], got {x.shape}"
+    )
+
+
+def compute_moving_score(moving_score_source, tokens_per_frame, eps=1e-6):
+    moving_score_source = reshape_token_sequence(
+        moving_score_source,
+        tokens_per_frame,
+        "moving_score_source",
+    )
+
+    if moving_score_source.shape[1] < 2:
+        return moving_score_source.new_zeros(
+            moving_score_source.shape[0],
+            moving_score_source.shape[2],
+        )
+
+    return (
+        moving_score_source[:, 1:].detach().float()
+        - moving_score_source[:, :-1].detach().float()
+    ).norm(dim=-1).mean(dim=1)
 
 
 def destination_loss_safe(
@@ -325,28 +346,208 @@ def destination_loss_safe(
     return loss
 
 
+# def source_conditioned_destination_loss(
+#     h: torch.Tensor,
+#     ta: torch.Tensor,
+#     tokens_per_frame: int,
+#     tau_src: float = 3.0,
+#     tau_dest: float = 3.0,
+#     tau_sim: float = 0.2,
+#     topk_ratio: float = 0.2,
+#     eps: float = 1e-6,
+# ) -> torch.Tensor:
+#     if h.shape != ta.shape:
+#         raise ValueError(f"h and ta must have same shape, got {h.shape} vs {ta.shape}")
+
+#     if h.dim() == 3:
+#         B, seq_len, D = h.shape
+#         if seq_len % tokens_per_frame != 0:
+#             raise ValueError(
+#                 f"seq_len={seq_len} is not divisible by tokens_per_frame={tokens_per_frame}"
+#             )
+#         F_ = seq_len // tokens_per_frame
+#         h = h.reshape(B, F_, tokens_per_frame, D)
+#         ta = ta.reshape(B, F_, tokens_per_frame, D)
+
+#     elif h.dim() == 4:
+#         B, F_, T, D = h.shape
+#     else:
+#         raise ValueError(f"Expected [B,F,T,D] or [B,F*T,D], got {h.shape}")
+
+#     if h.shape[1] < 2:
+#         return h.new_zeros(())
+
+#     # 1. source motion weights: which start tokens are worth supervising
+#     moving_score = (ta[:, 1:].detach().float() - ta[:, :-1].detach().float()).norm(dim=-1).mean(dim=1)
+
+#     src_prob = build_topk_dest_prob(
+#         moving_score,
+#         topk_ratio=topk_ratio,
+#         tau=tau_src,
+#         eps=eps,
+#     ).detach()
+
+#     # 2. destination saliency prior: which final tokens are likely endpoints / important regions
+#     dest_score = ta[:, -1].detach().float().norm(dim=-1)
+
+#     dest_prob = build_topk_dest_prob(
+#         dest_score,
+#         topk_ratio=topk_ratio,
+#         tau=tau_dest,
+#         eps=eps,
+#         largest = False,
+#     ).detach()
+
+#     # 3. h predicted source-to-destination distribution p(j|i)
+#     h_src = F.normalize(h[:, 0].float(), dim=-1, eps=eps)
+#     ta_dest = F.normalize(ta[:, -1].detach().float(), dim=-1, eps=eps)
+
+#     sim_h = torch.matmul(h_src, ta_dest.transpose(-1, -2))
+#     log_pred = F.log_softmax(sim_h / max(tau_sim, eps), dim=-1)
+
+#     # 4. TA source-conditioned target distribution q(j|i)
+#     ta_src = F.normalize(ta[:, 0].detach().float(), dim=-1, eps=eps)
+
+#     sim_ta = torch.matmul(ta_src, ta_dest.transpose(-1, -2))
+
+#     target_logits = (
+#         sim_ta / max(tau_sim, eps)
+#         + torch.log(dest_prob.unsqueeze(1) + eps)
+#     )
+
+#     target = F.softmax(target_logits, dim=-1).detach()
+
+#     # 5. distillation loss, weighted by moving source tokens
+#     kl_each = F.kl_div(
+#         log_pred,
+#         target,
+#         reduction="none",
+#     ).sum(dim=-1)
+
+#     loss = (src_prob * kl_each).sum() / (src_prob.sum() + eps)
+#     return loss * 0.5
+
+def source_conditioned_destination_loss(
+    h: torch.Tensor,
+    ta: torch.Tensor,
+    tokens_per_frame: int,
+    moving_score_source: torch.Tensor | None = None,
+    moving_score: torch.Tensor | None = None,
+    src_prob: torch.Tensor | None = None,
+    tau_src: float = 3.0,
+    tau_sim: float = 0.2,
+    topk_ratio: float = 0.2,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if h.shape != ta.shape:
+        raise ValueError(f"h and ta must have same shape, got {h.shape} vs {ta.shape}")
+ 
+    h = reshape_token_sequence(h, tokens_per_frame, "h")
+    ta = reshape_token_sequence(ta, tokens_per_frame, "ta")
+ 
+    if h.shape[1] < 2:
+        return h.new_zeros(())
+
+    if src_prob is None:
+        if moving_score is None:
+            moving_score_source = ta if moving_score_source is None else moving_score_source
+            moving_score = compute_moving_score(
+                moving_score_source,
+                tokens_per_frame,
+                eps=eps,
+            )
+        else:
+            if moving_score.shape != h.shape[:1] + h.shape[2:3]:
+                raise ValueError(
+                    "moving_score must have shape [B, Tokens], "
+                    f"got {moving_score.shape} for h shape {h.shape}"
+                )
+
+        src_prob = build_topk_dest_prob(
+            moving_score,
+            topk_ratio=topk_ratio,
+            tau=tau_src,
+            eps=eps,
+        )
+    else:
+        if src_prob.shape != h.shape[:1] + h.shape[2:3]:
+            raise ValueError(
+                "src_prob must have shape [B, Tokens], "
+                f"got {src_prob.shape} for h shape {h.shape}"
+            )
+
+    src_prob = src_prob.detach()
+ 
+    # 2. H predicted source-to-destination distribution p_h(j | i).
+    # Source: h at first frame.
+    # Destination: TA at final frame.
+    h_src = F.normalize(h[:, 0].float(), dim=-1, eps=eps)
+    ta_dest = F.normalize(ta[:, -1].detach().float(), dim=-1, eps=eps)
+ 
+    sim_h = torch.matmul(h_src, ta_dest.transpose(-1, -2))
+    log_pred = F.log_softmax(sim_h / max(tau_sim, eps), dim=-1)
+ 
+    # 3. TA teacher source-to-destination distribution q_ta(j | i).
+    # No destination norm prior here.
+    ta_src = F.normalize(ta[:, 0].detach().float(), dim=-1, eps=eps)
+ 
+    sim_ta = torch.matmul(ta_src, ta_dest.transpose(-1, -2))
+    target = F.softmax(sim_ta / max(tau_sim, eps), dim=-1).detach()
+ 
+    # 4. Source-weighted KL distillation.
+    kl_each = F.kl_div(
+        log_pred,
+        target,
+        reduction="none",
+    ).sum(dim=-1)
+ 
+    loss = (src_prob * kl_each).sum() / (src_prob.sum() + eps)
+ 
+    return loss * 0.5
+
+
 def unified_dest_and_motion(
     h,
     ta,
+    moving_score_source=None,
     Tokens=192,
-    tau_dest=3.0,
     tau_sim=0.1,
     tau_src=3.0,
-    topk_ratio=0.1,
+    topk_ratio=0.3,
     eps=1e-6,
 ):
-    loss_dest = destination_loss_safe(
+    moving_score_source = ta if moving_score_source is None else moving_score_source
+    moving_score = compute_moving_score(
+        moving_score_source,
+        Tokens,
+        eps=eps,
+    )
+
+    src_prob = build_topk_dest_prob(
+        moving_score,
+        topk_ratio=topk_ratio,
+        tau=tau_src,
+        eps=eps,
+    ).detach()
+
+    loss_dest = source_conditioned_destination_loss(
         h,
         ta,
-        Tokens=Tokens,
-        tau_dest=tau_dest,
+        tokens_per_frame=Tokens,
+        src_prob=src_prob,
         tau_sim=tau_sim,
         tau_src=tau_src,
         topk_ratio=topk_ratio,
         eps=eps,
     )
     
-    loss_motion = motion_incremental_alignment_tokenwise(h, ta, Tokens=Tokens, eps=eps)
+    loss_motion = motion_incremental_alignment_tokenwise(
+        h,
+        ta,
+        Tokens=Tokens,
+        motion_weight=src_prob,
+        eps=eps,
+    )
     
     return {
         'dest_loss': loss_dest,

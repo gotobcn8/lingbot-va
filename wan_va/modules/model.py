@@ -966,10 +966,16 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 '1 (b l) c -> b l c',
                 b=batch_size,
             )
+            raw_trace_hidden_states = trace_hidden_states
             align_hidden_states = self.align_repr_proj(align_hidden_states)
             trace_hidden_states = self.trace_proj(trace_hidden_states)
             # trace_loss = alignment_module(align_hidden_states, trace_hidden_states, K = self.K_frames, Tokens = tokens)
-            trace_loss = alignment_module(align_hidden_states, trace_hidden_states, Tokens = tokens)
+            trace_loss = alignment_module(
+                align_hidden_states,
+                trace_hidden_states,
+                moving_score_source=raw_trace_hidden_states,
+                Tokens=tokens,
+            )
             return latent_hidden_states, action_hidden_states, trace_loss
 
         return latent_hidden_states, action_hidden_states

@@ -71,6 +71,36 @@ def test_motion_incremental_alignment_raises_for_unknown_pool():
         alignment.motion_incremental_alignment(x, x.clone(), Tokens=3, pool="sum")
 
 
+def test_motion_incremental_alignment_tokenwise_uses_motion_weight():
+    a = torch.tensor(
+        [[[0.0, 0.0], [0.0, 0.0], [1.0, 0.0], [1.0, 0.0]]],
+        dtype=torch.float32,
+    )
+    b = torch.tensor(
+        [[[0.0, 0.0], [0.0, 0.0], [1.0, 0.0], [-1.0, 0.0]]],
+        dtype=torch.float32,
+    )
+
+    static_token_weight = torch.tensor([[1.0, 0.0]])
+    moving_token_weight = torch.tensor([[0.0, 1.0]])
+
+    static_loss = alignment.motion_incremental_alignment_tokenwise(
+        a,
+        b,
+        Tokens=2,
+        motion_weight=static_token_weight,
+    )
+    moving_loss = alignment.motion_incremental_alignment_tokenwise(
+        a,
+        b,
+        Tokens=2,
+        motion_weight=moving_token_weight,
+    )
+
+    assert torch.isclose(static_loss, torch.tensor(0.0), atol=1e-6)
+    assert torch.isclose(moving_loss, torch.tensor(2.0), atol=1e-6)
+
+
 def test_build_topk_dest_prob_keeps_only_top_tokens():
     score = torch.tensor([[1.0, 4.0, 2.0, 3.0]])
 
@@ -104,3 +134,42 @@ def test_destination_loss_safe_accepts_flat_sequence():
 
     assert loss.shape == torch.Size([])
     assert torch.isfinite(loss)
+
+
+def test_unified_dest_and_motion_accepts_pre_projection_moving_score_source():
+    h = torch.randn(1, 6, 5, requires_grad=True)
+    raw_trace = torch.randn(1, 6, 7, requires_grad=True)
+    trace_proj = torch.nn.Linear(7, 5)
+    ta = trace_proj(raw_trace)
+
+    original_build_topk_dest_prob = alignment.build_topk_dest_prob
+    build_topk_call_count = 0
+
+    def wrapped_build_topk_dest_prob(*args, **kwargs):
+        nonlocal build_topk_call_count
+        build_topk_call_count += 1
+        return original_build_topk_dest_prob(*args, **kwargs)
+
+    alignment.build_topk_dest_prob = wrapped_build_topk_dest_prob
+
+    try:
+        losses = alignment.unified_dest_and_motion(
+            h,
+            ta,
+            moving_score_source=raw_trace,
+            Tokens=2,
+        )
+    finally:
+        alignment.build_topk_dest_prob = original_build_topk_dest_prob
+
+    assert set(losses) == {"dest_loss", "motion_loss"}
+    assert torch.isfinite(losses["dest_loss"])
+    assert torch.isfinite(losses["motion_loss"])
+    assert build_topk_call_count == 1
+
+    total_loss = losses["dest_loss"] + losses["motion_loss"]
+    total_loss.backward()
+
+    assert h.grad is not None
+    assert raw_trace.grad is None
+    assert all(param.grad is None for param in trace_proj.parameters())
